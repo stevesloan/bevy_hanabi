@@ -47,14 +47,8 @@ struct VertexOutput {
 fn get_camera_position_effect_space() -> vec3<f32> {
     let view_pos = view.world_from_view[3].xyz;
 #ifdef LOCAL_SPACE_SIMULATION
-    let inverse_transform = transpose(
-        mat3x3(
-            spawners[batch_info.base_effect + effect_location.effect_index].inverse_transform[0].xyz,
-            spawners[batch_info.base_effect + effect_location.effect_index].inverse_transform[1].xyz,
-            spawners[batch_info.base_effect + effect_location.effect_index].inverse_transform[2].xyz,
-        )
-    );
-    return inverse_transform * view_pos;
+    let inverse_transform = unpack_compressed_transform(spawners[batch_info.base_effect + effect_location.effect_index].inverse_transform);
+    return (inverse_transform * vec4<f32>(view_pos, 1.0)).xyz;
 #else
     return view_pos;
 #endif
