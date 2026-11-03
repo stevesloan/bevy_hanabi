@@ -204,6 +204,11 @@ fn vertex(
     @if(!HAS_BATCHED_DRAW)
     spawner_index = batch_info.spawner_base;
     let spawner = &spawners[spawner_index];
+    if (instance_index >= (*spawner).render_instance_count) {
+        var culled: VertexOutput;
+        culled.position = vec4(0.0);
+        return culled;
+    }
     effect_metadata_index = (*spawner).effect_metadata_index;
     let base_particle = effect_location.base_particle;
 

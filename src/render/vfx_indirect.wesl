@@ -81,3 +81,15 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     // to determine where to read particle indices.
     (*spawner).render_indirect_read_index = pong;
 }
+
+/// Copy each effect's final draw count into its spawner, for direct draws.
+@compute @workgroup_size(64)
+fn copy_instance_count(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+    let global_effect_index = global_invocation_id.x;
+    if (global_effect_index >= sim_params.num_effects) {
+        return;
+    }
+    let spawner = &spawner_buffer[global_effect_index];
+    let dri_base = DRAW_INDEXED_INDIRECT_STRIDE * (*spawner).draw_indirect_index;
+    (*spawner).render_instance_count = draw_indirect_buffer[dri_base + 1u];
+}

@@ -51,9 +51,9 @@ struct Spawner {
     /// This is ignored if the effect has no parent.
     parent_slab_offset: u32,
 
-    // Keep this field here separate from auto-padding below, so that the WGSL and Rust
-    // struct definitions match.
-    unused: u32,
+    /// Particles to draw this frame, copied from the draw args after the update
+    /// pass by `copy_instance_count`, for direct draws.
+    render_instance_count: u32,
 
     {{SPAWNER_PADDING}}
 }

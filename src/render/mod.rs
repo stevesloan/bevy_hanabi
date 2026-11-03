@@ -436,8 +436,9 @@ pub(crate) struct GpuSpawnerParams {
     /// effect's slab (if the effect has a parent effect), in number of
     /// particles (row index). This is ignored if the effect has no parent.
     parent_slab_offset: u32,
-    // For Pod
-    _padding0: u32,
+    /// Number of particles to draw, copied by the GPU from the indirect draw
+    /// args after the update pass, for direct draws. Zero as uploaded.
+    render_instance_count: u32,
 }
 
 impl GpuSpawnerParams {
@@ -1133,6 +1134,8 @@ pub(crate) struct DispatchIndirectPipelineKey {
     /// update pass optionally produce more events.
     /// Key: HAS_GPU_SPAWN_EVENTS
     has_events: bool,
+    /// Entry point `copy_instance_count` instead of `main`.
+    copy_instance_count: bool,
 }
 
 impl SpecializedComputePipeline for DispatchIndirectPipeline {
@@ -1158,11 +1161,16 @@ impl SpecializedComputePipeline for DispatchIndirectPipeline {
         }
 
         let label = format!(
-            "hanabi:compute_pipeline:dispatch_indirect{}",
+            "hanabi:compute_pipeline:dispatch_indirect{}{}",
             if key.has_events {
                 "_events"
             } else {
                 "_noevent"
+            },
+            if key.copy_instance_count {
+                "_copy_count"
+            } else {
+                ""
             }
         );
 
@@ -1177,7 +1185,11 @@ impl SpecializedComputePipeline for DispatchIndirectPipeline {
                 self.indirect_shader_noevent.clone()
             },
             shader_defs,
-            entry_point: Some("main".into()),
+            entry_point: Some(if key.copy_instance_count {
+                "copy_instance_count".into()
+            } else {
+                "main".into()
+            }),
             zero_initialize_workgroup_memory: false,
         }
     }
@@ -3081,6 +3093,8 @@ pub struct EffectsMeta {
     /// Pipeline cache ID of the two indirect dispatch pass pipelines (the
     /// -noevent and -events variants).
     indirect_pipeline_ids: [CachedComputePipelineId; 2],
+    /// The same two variants with the `copy_instance_count` entry point.
+    copy_count_pipeline_ids: [CachedComputePipelineId; 2],
     /// Pipeline cache ID of the active indirect dispatch pass pipeline, which
     /// is either the -noevent or -events variant depending on whether there's
     /// any child effect with GPU events currently active.
@@ -3141,6 +3155,7 @@ impl EffectsMeta {
                 CachedComputePipelineId::INVALID,
                 CachedComputePipelineId::INVALID,
             ],
+            copy_count_pipeline_ids: [CachedComputePipelineId::INVALID; 2],
             active_indirect_pipeline_id: CachedComputePipelineId::INVALID,
             prefix_sum_shader,
             prefix_sum_bind_group: None,
@@ -4077,15 +4092,34 @@ pub fn prepare_indirect_pipeline(
         effects_meta.indirect_pipeline_ids[0] = specialized_indirect_pipelines.specialize(
             pipeline_cache.as_ref(),
             &indirect_pipeline,
-            DispatchIndirectPipelineKey { has_events: false },
+            DispatchIndirectPipelineKey {
+                has_events: false,
+                copy_instance_count: false,
+            },
         );
     }
     if effects_meta.indirect_pipeline_ids[1] == CachedComputePipelineId::INVALID {
         effects_meta.indirect_pipeline_ids[1] = specialized_indirect_pipelines.specialize(
             pipeline_cache.as_ref(),
             &indirect_pipeline,
-            DispatchIndirectPipelineKey { has_events: true },
+            DispatchIndirectPipelineKey {
+                has_events: true,
+                copy_instance_count: false,
+            },
         );
+    }
+
+    for (index, has_events) in [false, true].into_iter().enumerate() {
+        if effects_meta.copy_count_pipeline_ids[index] == CachedComputePipelineId::INVALID {
+            effects_meta.copy_count_pipeline_ids[index] = specialized_indirect_pipelines.specialize(
+                pipeline_cache.as_ref(),
+                &indirect_pipeline,
+                DispatchIndirectPipelineKey {
+                    has_events,
+                    copy_instance_count: true,
+                },
+            );
+        }
     }
 
     // Select the active one depending on whether there's any child info to
@@ -6839,6 +6873,9 @@ fn draw<'w>(
     pipeline_id: CachedRenderPipelineId,
     params: &mut DrawEffectsSystemState,
 ) {
+    // Adreno 740 (Quest 3) drivers hang the GPU on these indirect draws, so
+    // Android draws every slot and the vertex shader culls the dead ones.
+    let direct = cfg!(target_os = "android");
     let (
         effects_meta,
         effect_bind_groups,
@@ -6960,7 +6997,15 @@ fn draw<'w>(
                     draw_indirect_offset,
                     draw_indirect_index,
                 );
-                pass.draw_indexed_indirect(indirect_buffer, draw_indirect_offset);
+                if direct {
+                    pass.draw_indexed(
+                        index_buffer_slice.range.clone(),
+                        vertex_buffer_slice.range.start as i32,
+                        0..effect_batch.capacity,
+                    );
+                } else {
+                    pass.draw_indexed_indirect(indirect_buffer, draw_indirect_offset);
+                }
             }
         }
         RenderMeshBufferInfo::NonIndexed => {
@@ -6988,7 +7033,11 @@ fn draw<'w>(
                 assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
                 let draw_indirect_offset =
                     draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
-                pass.draw_indirect(indirect_buffer, draw_indirect_offset);
+                if direct {
+                    pass.draw(vertex_buffer_slice.range.clone(), 0..effect_batch.capacity);
+                } else {
+                    pass.draw_indirect(indirect_buffer, draw_indirect_offset);
+                }
             }
         }
     }
@@ -7612,6 +7661,37 @@ fn simulate(
                 .dispatch_workgroups_indirect(indirect_buffer, dispatch_indirect_offset as u64);
 
             trace!("update compute dispatched");
+        }
+    }
+
+    // Copy the draw counts the update pass produced into the spawners, for
+    // direct draws, which can't read them from the indirect args.
+    {
+        let mut compute_pass = HanabiComputePass::new(
+            "hanabi:copy_instance_count",
+            &pipeline_cache,
+            &mut render_context,
+        );
+        let has_gpu_spawn_events = !event_cache.child_infos().is_empty();
+        let pipeline_id = effects_meta.copy_count_pipeline_ids[has_gpu_spawn_events as usize];
+        let events_bound = if has_gpu_spawn_events {
+            match event_cache.indirect_child_info_buffer_bind_group() {
+                Some(bind_group) => {
+                    compute_pass.set_bind_group(3, bind_group, &[]);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        if events_bound && compute_pass.set_cached_compute_pipeline(pipeline_id).is_ok() {
+            const WORKGROUP_SIZE: u32 = 64;
+            let total_effect_count = effects_meta.spawner_buffer.len() as u32;
+            compute_pass.set_bind_group(0, init_and_indirect_sim_params_bind_group, &[]);
+            compute_pass.set_bind_group(1, indirect_metadata_bind_group, &[]);
+            compute_pass.set_bind_group(2, indirect_spawner_bind_group, &[]);
+            compute_pass.dispatch_workgroups(total_effect_count.div_ceil(WORKGROUP_SIZE), 1, 1);
         }
     }
 
