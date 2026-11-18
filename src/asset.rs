@@ -55,6 +55,10 @@ pub enum SortMode {
     BackToFront,
 }
 
+/// Maximum number of edges of [`EffectAsset::with_depth_slices()`], for at
+/// most eight bands.
+pub const MAX_DEPTH_SLICE_EDGES: usize = 7;
+
 /// Type of motion integration applied to the particles of a system.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect, Serialize, Deserialize)]
 pub enum MotionIntegration {
@@ -355,6 +359,10 @@ pub struct EffectAsset {
     pub alpha_mode: AlphaMode,
     /// Order in which the particles of each instance are drawn.
     pub sort_mode: SortMode,
+    /// Distances from the camera at which the sorted particles of each
+    /// instance are split into separately ordered draws. See
+    /// [`EffectAsset::with_depth_slices()`].
+    pub depth_slices: Vec<f32>,
     /// The mesh that each particle renders.
     ///
     /// The asset path must reference a [`Mesh`] asset. If `None`, the effect
@@ -495,6 +503,30 @@ impl EffectAsset {
     /// See [`SortMode`] for details.
     pub fn with_sort_mode(mut self, sort_mode: SortMode) -> Self {
         self.sort_mode = sort_mode;
+        self
+    }
+
+    /// Draw the particles of each instance as several transparent items, one
+    /// per band of distance from the camera, split at `edges`.
+    ///
+    /// An instance is otherwise ordered against other transparent objects as
+    /// a whole, at one point. For an effect spread through the scene (smoke
+    /// laid along many paths, ground fog), anything drawn in it then lands
+    /// entirely in front of or behind all of it. With slices, each band is
+    /// ordered at its own middle distance (the open farthest band at one and
+    /// a half times its near edge), so an object inside the effect is
+    /// misordered only against the particles of its own band. The bands
+    /// never change order among themselves.
+    ///
+    /// Requires [`SortMode::BackToFront`]: each band's particles are the
+    /// range of the sorted particles at its distances. `edges` must be
+    /// positive and ascending, at most [`MAX_DEPTH_SLICE_EDGES`] of them.
+    /// Slices are only drawn separately in 3D.
+    ///
+    /// Each band is its own draw call over the instance's particles, so the
+    /// vertex shader runs once per particle per band.
+    pub fn with_depth_slices(mut self, edges: impl Into<Vec<f32>>) -> Self {
+        self.depth_slices = edges.into();
         self
     }
 
@@ -769,7 +801,7 @@ impl bevy::reflect::serde::SerializeWithRegistry for EffectAsset {
     {
         use serde::ser::SerializeStruct as _;
 
-        let mut s = serializer.serialize_struct("EffectAsset", 15)?;
+        let mut s = serializer.serialize_struct("EffectAsset", 16)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("capacity", &self.capacity)?;
         s.serialize_field("spawner", &self.spawner)?;
@@ -793,6 +825,7 @@ impl bevy::reflect::serde::SerializeWithRegistry for EffectAsset {
         s.serialize_field("module", &self.module)?;
         s.serialize_field("alpha_mode", &self.alpha_mode)?;
         s.serialize_field("sort_mode", &self.sort_mode)?;
+        s.serialize_field("depth_slices", &self.depth_slices)?;
         s.serialize_field("mesh", &self.mesh)?;
         s.end()
     }
@@ -821,6 +854,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
             Module,
             AlphaMode,
             SortMode,
+            DepthSlices,
             Mesh,
         }
 
@@ -860,6 +894,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                 let mut module = None;
                 let mut alpha_mode = None;
                 let mut sort_mode = None;
+                let mut depth_slices = None;
                 let mut mesh = None;
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -966,6 +1001,12 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                             }
                             sort_mode = Some(map.next_value()?);
                         }
+                        Field::DepthSlices => {
+                            if depth_slices.is_some() {
+                                return Err(serde::de::Error::duplicate_field("depth_slices"));
+                            }
+                            depth_slices = Some(map.next_value()?);
+                        }
                         Field::Mesh => {
                             if mesh.is_some() {
                                 return Err(serde::de::Error::duplicate_field("mesh"));
@@ -995,6 +1036,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                     alpha_mode.ok_or_else(|| serde::de::Error::missing_field("alpha_mode"))?;
                 // Optional, so assets serialized before it existed still load.
                 let sort_mode = sort_mode.unwrap_or_default();
+                let depth_slices = depth_slices.unwrap_or_default();
                 let mesh = mesh.ok_or_else(|| serde::de::Error::missing_field("mesh"))?;
                 // Modifiers uses ReflectModifier type data to construct a
                 // concrete type. So we can directly try_take()
@@ -1032,6 +1074,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                     module,
                     alpha_mode,
                     sort_mode,
+                    depth_slices,
                     mesh,
                 })
             }
@@ -1052,6 +1095,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
             "module",
             "alpha_mode",
             "sort_mode",
+            "depth_slices",
             "mesh",
         ];
         deserializer.deserialize_struct(
@@ -1392,6 +1436,7 @@ mod tests {
             motion_integration: MotionIntegration::PreUpdate,
             alpha_mode: AlphaMode::Multiply,
             sort_mode: SortMode::BackToFront,
+            depth_slices: vec![4.0, 10.0],
             ..Default::default()
         }
         .init(mod_pos);
@@ -1424,6 +1469,7 @@ mod tests {
         assert_eq!(effect.module, effect_serde.module);
         assert_eq!(effect.alpha_mode, effect_serde.alpha_mode);
         assert_eq!(effect.sort_mode, effect_serde.sort_mode);
+        assert_eq!(effect.depth_slices, effect_serde.depth_slices);
         assert_eq!(
             effect.init_modifiers().count(),
             effect_serde.init_modifiers().count()

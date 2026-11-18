@@ -368,7 +368,7 @@ fn real_ribbon_sort_chain_isolated_per_instance() -> Result<(), Box<dyn std::err
             storage(0, false, false),
             storage(1, true, false),
             storage(2, false, false),
-            storage(3, true, true),
+            storage(3, false, true),
             storage(4, true, true),
         ],
     });
@@ -553,6 +553,238 @@ fn real_ribbon_sort_chain_isolated_per_instance() -> Result<(), Box<dyn std::err
         ]
     );
     Ok(())
+}
+
+/// Sort the particles at `distances` back-to-front through the real
+/// sort-fill, sort and sort-copy shaders, with the given depth slice edges;
+/// the spawner's resulting `depth_slice_rows` and the sorted particle indices.
+fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
+    let renderer = MockRenderer::new();
+    let device = renderer.device();
+    let queue = renderer.queue();
+    let wgpu_device = device.wgpu_device();
+    let storage_alignment = device.limits().min_storage_buffer_offset_alignment;
+    let count = distances.len() as u32;
+
+    let fill_shader = create_composed_shader_module(
+        &device,
+        storage_alignment,
+        include_str!("vfx_sort_fill.wesl"),
+        "bevy_hanabi::vfx_sort_fill",
+    )
+    .unwrap();
+    let copy_shader = create_composed_shader_module(
+        &device,
+        storage_alignment,
+        include_str!("vfx_sort_copy.wesl"),
+        "bevy_hanabi::vfx_sort_copy",
+    )
+    .unwrap();
+
+    let metadata = GpuEffectMetadata {
+        capacity: count,
+        alive_count: count,
+        indirect_write_index: 0,
+        particle_stride: 1,
+        sort_key_offset: 0,
+        sort_key2_offset: 0,
+        ..default()
+    };
+    let mut spawner = GpuSpawnerParams {
+        depth_slice_count: edges.len() as u32,
+        ..default()
+    };
+    spawner.depth_slice_edges[..edges.len()].copy_from_slice(edges);
+    // Stale rows from a previous frame, which the pass must overwrite.
+    spawner.depth_slice_rows = [99; 8];
+    // The back-to-front key, as the update pass writes it.
+    let particles: Vec<u32> = distances.iter().map(|d| !d.to_bits()).collect();
+    let indirect_indices: Vec<u32> = (0..count).flat_map(|i| [i, 0, u32::MAX]).collect();
+
+    let particle_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:particles"),
+        contents: cast_slice(&particles),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let indirect_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:indirect"),
+        contents: cast_slice(&indirect_indices),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let metadata_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:metadata"),
+        contents: cast_slice(&[metadata]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let spawner_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:spawner"),
+        contents: &padded_slice_content(&[spawner], storage_alignment),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let copy_source_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:copy_source"),
+        contents: cast_slice(&[0_u32, 0]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let sort_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hanabi:test:slices:sort"),
+        size: 4 + 12 * count as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let dispatch_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:dispatch"),
+        contents: cast_slice(&[GpuDispatchIndirectArgs { x: 1, y: 1, z: 1 }]),
+        usage: wgpu::BufferUsages::INDIRECT,
+    });
+
+    let storage = |binding, read_only, dynamic| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: dynamic,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let spawner_binding = || {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &spawner_buffer,
+            offset: 0,
+            size: NonZeroU64::new(storage_alignment as u64),
+        })
+    };
+    let fill_bgl = wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("hanabi:test:slices:fill:bgl"),
+        entries: &[
+            storage(0, false, false),
+            storage(1, true, false),
+            storage(2, true, false),
+            storage(3, false, false),
+            storage(4, true, true),
+        ],
+    });
+    let copy_bgl = wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("hanabi:test:slices:copy:bgl"),
+        entries: &[
+            storage(0, false, false),
+            storage(1, true, false),
+            storage(2, false, false),
+            storage(3, false, true),
+            storage(4, true, true),
+        ],
+    });
+    fn entries<'a>(resources: [wgpu::BindingResource<'a>; 5]) -> Vec<wgpu::BindGroupEntry<'a>> {
+        resources
+            .into_iter()
+            .enumerate()
+            .map(|(binding, resource)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource,
+            })
+            .collect()
+    }
+    let fill_bg = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hanabi:test:slices:fill:bg"),
+        layout: &fill_bgl,
+        entries: &entries([
+            sort_buffer.as_entire_binding(),
+            particle_buffer.as_entire_binding(),
+            indirect_buffer.as_entire_binding(),
+            metadata_buffer.as_entire_binding(),
+            spawner_binding(),
+        ]),
+    });
+    let copy_bg = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hanabi:test:slices:copy:bg"),
+        layout: &copy_bgl,
+        entries: &entries([
+            indirect_buffer.as_entire_binding(),
+            sort_buffer.as_entire_binding(),
+            metadata_buffer.as_entire_binding(),
+            spawner_binding(),
+            copy_source_buffer.as_entire_binding(),
+        ]),
+    });
+    let pipeline = |label, bgl: &wgpu::BindGroupLayout, module, entry_point| {
+        let layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(bgl)],
+            immediate_size: 0,
+        });
+        wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&layout),
+            module,
+            entry_point: Some(entry_point),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        })
+    };
+    let fill_pipeline = pipeline("hanabi:test:slices:fill", &fill_bgl, &fill_shader, "sort_fill");
+    let copy_pipeline = pipeline("hanabi:test:slices:copy", &copy_bgl, &copy_shader, "sort_copy");
+    let (sort_pipeline, sort_bg) = create_sort_pipeline(wgpu_device, &sort_buffer);
+
+    let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hanabi:test:slices:chain"),
+    });
+    encoder.clear_buffer(&sort_buffer, 0, Some(4));
+    for (pipeline, bind_group, offsets) in [
+        (&fill_pipeline, &fill_bg, &[0_u32][..]),
+        (&sort_pipeline, &sort_bg, &[][..]),
+        (&copy_pipeline, &copy_bg, &[0, 0][..]),
+    ] {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("hanabi:test:slices:pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, offsets);
+        pass.dispatch_workgroups_indirect(&dispatch_buffer, 0);
+    }
+    submit_and_wait(&device, &queue, encoder.finish());
+
+    let spawner_out = readback_vec::<u8>(
+        &device,
+        &queue,
+        &spawner_buffer,
+        storage_alignment as u64,
+    );
+    let spawner_out: GpuSpawnerParams =
+        bytemuck::pod_read_unaligned(&spawner_out[..size_of::<GpuSpawnerParams>()]);
+    let indirect_out = readback_vec::<u32>(
+        &device,
+        &queue,
+        &indirect_buffer,
+        (indirect_indices.len() * size_of::<u32>()) as u64,
+    );
+    let sorted = indirect_out.chunks(3).map(|row| row[0]).collect();
+    (spawner_out.depth_slice_rows, sorted)
+}
+
+#[test]
+fn real_sort_copy_finds_depth_slice_rows() {
+    // Sorted farthest first: 30, 12, 7, 5, 3, 1.
+    let distances = [1.0, 3.0, 5.0, 12.0, 30.0, 7.0];
+    let (rows, sorted) = sort_depth_slices(&distances, &[4.0, 10.0, 25.0]);
+    assert_eq!(sorted, [4, 3, 5, 2, 1, 0]);
+    // At least 4 m: four particles; 10 m: two; 25 m: one; six in all.
+    assert_eq!(&rows[..4], &[4, 2, 1, 6]);
+
+    // Every particle nearer than every edge, or beyond them.
+    let (rows, _) = sort_depth_slices(&distances, &[50.0, 60.0]);
+    assert_eq!(&rows[..3], &[0, 0, 6]);
+    let (rows, _) = sort_depth_slices(&distances, &[0.5]);
+    assert_eq!(&rows[..2], &[6, 6]);
+
+    // A particle exactly at an edge is in the band beyond it.
+    let (rows, _) = sort_depth_slices(&distances, &[5.0]);
+    assert_eq!(&rows[..2], &[4, 6]);
+
+    // Without slices the rows are left alone.
+    let (rows, _) = sort_depth_slices(&distances, &[]);
+    assert_eq!(rows, [99; 8]);
 }
 
 #[test]

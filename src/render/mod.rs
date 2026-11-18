@@ -439,6 +439,22 @@ pub(crate) struct GpuSpawnerParams {
     /// Number of particles to draw, copied by the GPU from the indirect draw
     /// args after the update pass, for direct draws. Zero as uploaded.
     render_instance_count: u32,
+    /// Number of [`depth_slice_edges`] in use; zero if the effect isn't
+    /// drawn in depth slices.
+    ///
+    /// [`depth_slice_edges`]: Self::depth_slice_edges
+    depth_slice_count: u32,
+    /// Distances from the camera splitting the effect's sorted particles into
+    /// bands, ascending (see [`EffectAsset::with_depth_slices()`]).
+    ///
+    /// [`EffectAsset::with_depth_slices()`]: crate::EffectAsset::with_depth_slices
+    depth_slice_edges: [f32; 8],
+    /// Written by the sort-copy pass after sorting: for each edge, the number
+    /// of sorted particles at least that far, and after the last edge the
+    /// number sorted. Zero as uploaded.
+    depth_slice_rows: [u32; 8],
+    // For Pod
+    _padding1: [u32; 3],
 }
 
 impl GpuSpawnerParams {
@@ -451,7 +467,11 @@ impl GpuSpawnerParams {
         parent_slab_offset: Option<u32>,
         effect_metadata_buffer_table_id: BufferTableId,
         maybe_cached_draw_indirect_args: Option<&CachedDrawIndirectArgs>,
+        depth_slice_edges: &[f32],
     ) -> Self {
+        let mut edges = [0.0; 8];
+        let depth_slice_count = depth_slice_edges.len().min(crate::MAX_DEPTH_SLICE_EDGES);
+        edges[..depth_slice_count].copy_from_slice(&depth_slice_edges[..depth_slice_count]);
         let transform = global_transform.to_matrix().into();
         let inverse_transform = Mat4::from(
             // Inverse the Affine3A first, then convert to Mat4. This is a lot more
@@ -470,6 +490,8 @@ impl GpuSpawnerParams {
                 .unwrap_or_default(),
             slab_offset,
             parent_slab_offset: parent_slab_offset.unwrap_or(u32::MAX),
+            depth_slice_count: depth_slice_count as u32,
+            depth_slice_edges: edges,
             ..default()
         }
     }
@@ -585,6 +607,9 @@ pub struct GpuBatchInfo {
     /// Number of consecutive values in the prefix sum buffer for this batch.
     /// This is the number of effects batches together in the batch.
     pub prefix_sum_count: u32,
+    /// For a render batch info drawing one depth slice of its effect, the
+    /// slice's index, from the nearest; otherwise `u32::MAX`.
+    pub depth_slice: u32,
 }
 
 /// Metadata describing a single effect instance.
@@ -2359,6 +2384,8 @@ pub(crate) struct ExtractedEffect {
     pub effect_shaders: EffectShaders,
     /// Condition under which the effect is simulated.
     pub simulation_condition: SimulationCondition,
+    /// See [`EffectAsset::depth_slices`].
+    pub depth_slices: Vec<f32>,
 }
 
 /// Extracted data for the [`GpuSpawnerParams`].
@@ -2768,6 +2795,7 @@ pub(crate) fn extract_effects(
             alpha_mode,
             effect_shaders: effect_shaders.clone(),
             simulation_condition: asset.simulation_condition,
+            depth_slices: asset.depth_slices.clone(),
         };
         if let Some(mut extracted_effect) = maybe_extracted_effect {
             extracted_effect.set_if_neq(new_extracted_effect);
@@ -4656,6 +4684,7 @@ pub(crate) fn prepare_batch_inputs(
             parent_slab_offset,
             cached_effect_metadata.table_id,
             maybe_cached_draw_indirect_args,
+            &extracted_effect.depth_slices,
         );
 
         trace!("Updating cached effect at entity {render_entity:?}...");
@@ -4886,9 +4915,27 @@ pub(crate) fn batch_effects(
                     effect_batch_index,
                     instance,
                     translation,
+                    depth_slice: None,
                     main_entity: *main_entity,
                 })
                 .insert(TemporaryRenderEntity::default());
+            // A phase holds one item per render entity, so each band gets its
+            // own.
+            let edges = &extracted_effect.depth_slices;
+            for band in 0..batch::depth_slice_bands(edges) {
+                commands
+                    .spawn(EffectDrawBatch {
+                        effect_batch_index,
+                        instance,
+                        translation,
+                        depth_slice: Some(batch::DepthSliceDraw {
+                            band,
+                            distance: batch::depth_slice_distance(edges, band),
+                        }),
+                        main_entity: *main_entity,
+                    })
+                    .insert(TemporaryRenderEntity::default());
+            }
         }
         if let Some((sort_fill_indirect_dispatch_index, sort_indirect_dispatch_index)) =
             sort_indirect_dispatch_indices
@@ -5471,6 +5518,7 @@ fn emit_sorted_draw<T, F>(
     render_meshes: &RenderAssets<RenderMesh>,
     pipeline_cache: &PipelineCache,
     make_phase_item: F,
+    draws_depth_slices: bool,
     #[cfg(all(feature = "2d", feature = "3d"))] pipeline_mode: PipelineMode,
 ) where
     T: SortedPhaseItem,
@@ -5520,6 +5568,13 @@ fn emit_sorted_draw<T, F>(
             let Some(effect_batch) = batcher.get(draw_batch.effect_batch_index) else {
                 continue;
             };
+
+            // An effect drawn in depth slices has a draw for each band and
+            // one for the whole: the bands where this phase draws them.
+            let draw_bands = draws_depth_slices && !effect_batch.depth_slices.is_empty();
+            if draw_batch.depth_slice.is_some() != draw_bands {
+                continue;
+            }
 
             trace!(
                 "-> EffectBach: slab_id={} spawner_base={} layout_flags={:?}",
@@ -5726,6 +5781,10 @@ fn emit_binned_draw<T, F, G>(
                 draw_entity,
                 draw_batch.effect_batch_index,
             );
+
+            if draw_batch.depth_slice.is_some() {
+                continue;
+            }
 
             // Get the EffectBatches this EffectDrawBatch is part of.
             let Some(effect_batch) = batcher.get(draw_batch.effect_batch_index) else {
@@ -5979,6 +6038,7 @@ pub(crate) fn queue_effects(
                     extra_index: PhaseItemExtraIndex::None,
                     indexed: true, // ???
                 },
+                false,
                 #[cfg(feature = "3d")]
                 PipelineMode::Camera2d,
             );
@@ -6014,19 +6074,31 @@ pub(crate) fn queue_effects(
                 property_cache,
                 &render_meshes,
                 pipeline_cache,
-                |id, entity, batch, view| Transparent3d {
-                    sorting_info: TransparentSortingInfo3d::Sorted {
-                        mesh_center: batch.translation,
-                        depth_bias: 0.0,
-                    },
-                    distance: view.rangefinder3d().distance(&batch.translation),
-                    pipeline: id,
-                    entity,
-                    draw_function: draw_effects_function_3d,
-                    batch_range: 0..1,
-                    extra_index: PhaseItemExtraIndex::None,
-                    indexed: true, // ???
+                |id, entity, batch, view| {
+                    // A band is ordered at its distance straight ahead of the
+                    // view, so every view orders the bands alike.
+                    let mesh_center = match batch.depth_slice {
+                        Some(slice) => {
+                            view.world_from_view.translation()
+                                + view.world_from_view.forward() * slice.distance
+                        }
+                        None => batch.translation,
+                    };
+                    Transparent3d {
+                        sorting_info: TransparentSortingInfo3d::Sorted {
+                            mesh_center,
+                            depth_bias: 0.0,
+                        },
+                        distance: view.rangefinder3d().distance(&mesh_center),
+                        pipeline: id,
+                        entity,
+                        draw_function: draw_effects_function_3d,
+                        batch_range: 0..1,
+                        extra_index: PhaseItemExtraIndex::None,
+                        indexed: true, // ???
+                    }
                 },
+                true,
                 #[cfg(feature = "2d")]
                 PipelineMode::Camera3d,
             );
@@ -6977,6 +7049,11 @@ fn draw<'w>(
     let spawner_size = effects_meta.spawner_buffer.aligned_size() as u32;
     assert!(spawner_size >= GpuSpawnerParams::min_size().get() as u32);
 
+    // A band's batch info follows its effect's, nearest first.
+    let band_offset = effect_draw_batch.depth_slice.map_or(0, |slice| {
+        (slice.band + 1) * batcher.batch_info_buffer_aligned_size()
+    });
+
     match render_mesh.buffer_info {
         RenderMeshBufferInfo::Indexed { index_format, .. } => {
             let Some(index_buffer_slice) = mesh_allocator.mesh_index_slice(&effect_batch.mesh)
@@ -7007,7 +7084,7 @@ fn draw<'w>(
                 pass.set_bind_group(
                     2,
                     property_bind_group,
-                    &[effect_data.render_batch_info_offset],
+                    &[effect_data.render_batch_info_offset + band_offset],
                 );
                 let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
                 assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
@@ -7050,7 +7127,7 @@ fn draw<'w>(
                 pass.set_bind_group(
                     2,
                     property_bind_group,
-                    &[effect_data.render_batch_info_offset],
+                    &[effect_data.render_batch_info_offset + band_offset],
                 );
                 let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
                 assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);

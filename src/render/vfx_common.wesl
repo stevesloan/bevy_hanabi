@@ -55,6 +55,16 @@ struct Spawner {
     /// pass by `copy_instance_count`, for direct draws.
     render_instance_count: u32,
 
+    /// Number of `depth_slice_edges` in use; zero if not drawn in depth slices.
+    depth_slice_count: u32,
+    /// Distances splitting the sorted particles into bands, ascending.
+    depth_slice_edges: array<f32, 8>,
+    /// Written by `sort_copy`: for each edge, the number of sorted particles at
+    /// least that far; after the last edge, the number sorted.
+    depth_slice_rows: array<u32, 8>,
+    // Matches the Rust struct's explicit padding.
+    unused_depth_slice: array<u32, 3>,
+
     {{SPAWNER_PADDING}}
 }
 
@@ -171,6 +181,9 @@ struct BatchInfo {
     /// Number of active effects in the batch, and therefore number of
     /// consecutive prefix sum values for effects of this batch.
     prefix_sum_count: u32,
+    /// For a render batch info drawing one depth slice, its index from the
+    /// nearest; otherwise 0xFFFFFFFF.
+    depth_slice: u32,
 
     /// Padding for storage buffer alignment. This struct is sometimes bound as part
     /// of an array, or sometimes individually as a single unit. In the later case,

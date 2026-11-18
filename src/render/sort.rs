@@ -287,11 +287,8 @@ impl SortBindGroups {
                     // @group(0) @binding(2) var<storage, read_write> effect_metadatas :
                     // array<EffectMetadata>;
                     storage_buffer::<GpuEffectMetadata>(false),
-                    // @group(0) @binding(3) var<storage, read> spawner : Spawner;
-                    storage_buffer_read_only_sized(
-                        true,
-                        Some(GpuSpawnerParams::aligned_size(alignment)),
-                    ),
+                    // @group(0) @binding(3) var<storage, read_write> spawner : Spawner;
+                    storage_buffer_sized(true, Some(GpuSpawnerParams::aligned_size(alignment))),
                     // @group(0) @binding(4) var<storage, read> merge_params : MergeParams;
                     storage_buffer_read_only_sized(true, Some(GpuMergeParams::SHADER_SIZE)),
                 ),
@@ -739,7 +736,7 @@ impl SortBindGroups {
                         // @group(0) @binding(2) var<storage, read_write> effect_metadatas :
                         // array<EffectMetadata>;
                         effect_metadata_buffer.as_entire_binding(),
-                        // @group(0) @binding(3) var<storage, read> spawner : Spawner;
+                        // @group(0) @binding(3) var<storage, read_write> spawner : Spawner;
                         BufferBinding {
                             buffer: spawner_buffer,
                             offset: 0,

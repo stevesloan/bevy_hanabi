@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effect is ordered by among other transparent objects, in place of its origin.
   For effects whose particles spread far from their emitter, like a trail left
   in global space.
+- Added `EffectAsset::with_depth_slices()` (`EffectAsset::depth_slices`). An effect sorted
+  with `SortMode::BackToFront` can be drawn in 3D as one transparent item per band of distance
+  from the camera, each ordered at its band's middle, so other transparent objects inside a
+  widespread effect are ordered against the nearby particles rather than the whole effect.
 
 ### Fixed
 

@@ -132,7 +132,8 @@ pub(crate) struct BatchEffectData {
     /// Offset in bytes of the [`GpuBatchInfo`] into the
     /// [`Batcher::batch_info_buffer`], which contains the location of the
     /// particles to render for this effect instance. Ready for bind group
-    /// dynamic offset usage.
+    /// dynamic offset usage. For an effect drawn in depth slices, the band
+    /// infos follow it, nearest first.
     pub render_batch_info_offset: u32,
 }
 
@@ -192,6 +193,11 @@ pub(crate) struct EffectBatch {
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
     pub cached_effect_events: Option<CachedEffectEvents>,
+    /// Edges of the bands the effect is drawn in, if drawn in depth slices
+    /// (see [`EffectAsset::with_depth_slices()`]).
+    ///
+    /// [`EffectAsset::with_depth_slices()`]: crate::EffectAsset::with_depth_slices
+    pub depth_slices: Vec<f32>,
 }
 
 impl EffectBatch {
@@ -337,6 +343,7 @@ impl Batcher {
             base_particle,
             prefix_sum_offset,
             prefix_sum_count: u32::MAX, // invalid; set in end_batch()
+            depth_slice: u32::MAX,
         };
         trace!("batch info = {:?}", batch_info);
         self.batch_info_buffer.push(batch_info);
@@ -517,6 +524,14 @@ impl Batcher {
                 // effect in that batch.
                 self.add_effect_to_batch(0);
                 self.end_batch();
+                let bands = depth_slice_bands(&self.batches[batch_index].depth_slices);
+                let whole = *self.batch_info_buffer.last_mut().unwrap();
+                for band in 0..bands {
+                    self.batch_info_buffer.push(GpuBatchInfo {
+                        depth_slice: band,
+                        ..whole
+                    });
+                }
                 let render_batch_info_offset = render_batch_info_id
                     .checked_mul(batch_info_aligned_size)
                     .unwrap();
@@ -712,6 +727,38 @@ impl EffectSorter {
     }
 }
 
+/// Number of bands an effect with these depth slice edges is drawn in; zero
+/// if it's drawn whole.
+pub(crate) fn depth_slice_bands(edges: &[f32]) -> u32 {
+    if edges.is_empty() {
+        0
+    } else {
+        edges.len() as u32 + 1
+    }
+}
+
+/// Distance from the camera at which the given band (from the nearest) of an
+/// effect drawn in depth slices is ordered against other transparent items:
+/// its middle, or for the open farthest band one and a half times its near
+/// edge.
+pub(crate) fn depth_slice_distance(edges: &[f32], band: u32) -> f32 {
+    let band = band as usize;
+    let near = if band == 0 { 0.0 } else { edges[band - 1] };
+    match edges.get(band) {
+        Some(far) => (near + far) * 0.5,
+        None => near * 1.5,
+    }
+}
+
+/// One band of an effect drawn in depth slices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DepthSliceDraw {
+    /// The band, from the nearest.
+    pub band: u32,
+    /// See [`depth_slice_distance()`].
+    pub distance: f32,
+}
+
 /// Single effect batch to drive rendering.
 ///
 /// This component is spawned into the render world during the prepare phase
@@ -729,6 +776,8 @@ pub(crate) struct EffectDrawBatch {
     pub instance: Option<usize>,
     /// Position of the emitter so we can compute distance to camera.
     pub translation: Vec3,
+    /// For a draw of one band of an effect drawn in depth slices, which.
+    pub depth_slice: Option<DepthSliceDraw>,
     /// The main-world entity that contains this effect.
     #[allow(dead_code)]
     pub main_entity: MainEntity,
@@ -831,6 +880,7 @@ impl EffectBatch {
             texture_layout: extracted_effect.texture_layout.clone(),
             textures: extracted_effect.textures.clone(),
             alpha_mode: extracted_effect.alpha_mode,
+            depth_slices: extracted_effect.depth_slices.clone(),
             cached_effect_events: cached_effect_events.cloned(),
         }
     }
@@ -906,6 +956,17 @@ mod tests {
             Some((EffectBatchIndex(0), None))
         );
         assert_eq!(EffectDrawBatch::for_pushed(false, None, 1, 4), None);
+    }
+
+    #[test]
+    fn depth_slice_bands_are_ordered_at_their_middles() {
+        assert_eq!(depth_slice_bands(&[]), 0);
+        let edges = [4.0, 10.0, 25.0];
+        assert_eq!(depth_slice_bands(&edges), 4);
+        let distances: Vec<f32> = (0..4)
+            .map(|band| depth_slice_distance(&edges, band))
+            .collect();
+        assert_eq!(distances, [2.0, 7.0, 17.5, 37.5]);
     }
 
     #[test]
