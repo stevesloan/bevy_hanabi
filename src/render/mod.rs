@@ -76,8 +76,8 @@ use crate::{
         effect_cache::{AnyDrawIndirectArgs, CachedDrawIndirectArgs, SlabId},
     },
     AlphaMode, Attribute, CompiledParticleEffect, EffectProperties, EffectShaders,
-    EffectSimulation, EffectSpawner, EffectVisibilityClass, HanabiMainCamera, ParticleLayout,
-    PropertyLayout, SimulationCondition, TextureLayout,
+    EffectSimulation, EffectSortPoint, EffectSpawner, EffectVisibilityClass, HanabiMainCamera,
+    ParticleLayout, PropertyLayout, SimulationCondition, TextureLayout,
 };
 
 mod aligned_buffer_vec;
@@ -2377,6 +2377,9 @@ pub(crate) struct ExtractedSpawner {
     pub prng_seed: u32,
     /// Global transform of the effect origin.
     pub transform: GlobalTransform,
+    /// World-space point the effect is ordered by among transparent objects:
+    /// its [`EffectSortPoint`], else its origin.
+    pub sort_point: Vec3,
     /// Is the effect visible this frame?
     pub is_visible: bool,
 }
@@ -2645,6 +2648,7 @@ pub(crate) fn extract_effects(
             &CompiledParticleEffect,
             Option<Ref<EffectProperties>>,
             &GlobalTransform,
+            Option<&EffectSortPoint>,
         )>,
     >,
     // Render world effects extracted from a previous frame, if any
@@ -2671,6 +2675,7 @@ pub(crate) fn extract_effects(
         compiled_effect,
         maybe_properties,
         transform,
+        maybe_sort_point,
     ) in q_effects.iter()
     {
         // Check if shaders are configured
@@ -2779,6 +2784,7 @@ pub(crate) fn extract_effects(
             spawn_count: effect_spawner.spawn_count,
             prng_seed: compiled_effect.prng_seed,
             transform: *transform,
+            sort_point: EffectSortPoint::resolve(maybe_sort_point, transform),
             is_visible,
         };
         trace!(
@@ -2815,7 +2821,7 @@ pub(crate) fn extract_effects(
 
         // Extract the parent, if any, and resolve its render entity
         let parent_render_entity = if let Some(main_entity) = compiled_effect.parent {
-            let Ok((_, render_entity, _, _, _, _, _, _)) = q_effects.get(main_entity) else {
+            let Ok((_, render_entity, _, _, _, _, _, _, _)) = q_effects.get(main_entity) else {
                 error!(
                     "Failed to resolve render entity of parent with main entity {:?}.",
                     main_entity
@@ -4788,7 +4794,7 @@ pub(crate) fn batch_effects(
             continue;
         };
 
-        let translation = extracted_spawner.transform.translation();
+        let translation = extracted_spawner.sort_point;
         let instance_spawn_count = if input.event_buffer_index.is_some() {
             // GPU spawn based effects are not currently batched.
             0

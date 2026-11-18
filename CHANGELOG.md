@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `SortMode` and `EffectAsset::sort_mode`. With `SortMode::BackToFront`, the particles
-  of each effect instance are sorted on the GPU each frame to be drawn from the farthest to the
-  nearest from the `HanabiMainCamera`, so overlapping alpha-blended particles composite
-  correctly. The default `SortMode::None` keeps the previous unsorted order. Not supported
-  together with ribbons.
-
 ### Fixed
 
 - Fixed effects sharing a texture layout drawing with each other's textures: the cached bind
