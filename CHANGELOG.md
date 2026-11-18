@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+
+
 ### Fixed
 
 - Fixed effects sharing a texture layout drawing with each other's textures: the cached bind
   group binding an effect's material was keyed by its texture layout but not its textures, so
   the first effect created with a layout lent its textures to every later effect with the same
   layout and property block, until a buffer reallocation cleared the cache.
+- Fixed transparent effect instances batched together being drawn as one, ordered
+  among other transparent objects at the first instance's position. Each instance
+  is now drawn on its own at its own position; the simulation passes still run
+  the batch at once.
 
 ## [0.20.0] 2026-11-01
 

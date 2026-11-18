@@ -240,7 +240,7 @@ impl EffectBatch {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffectBatchIndex(pub u32);
 
 #[derive(Resource)]
@@ -722,15 +722,51 @@ impl EffectSorter {
 pub(crate) struct EffectDrawBatch {
     /// Index of the [`EffectBatch`] in the [`SortedEffectBatches`] this draw
     /// batch is part of.
-    ///
-    /// Note: currently there's a 1:1 mapping between effect batch and draw
-    /// batch.
     pub effect_batch_index: EffectBatchIndex,
+    /// The single effect instance of the batch this draws, or `None` for all
+    /// of them. A transparent effect is drawn one instance at a time, each
+    /// ordered among the other transparent objects at its own position.
+    pub instance: Option<usize>,
     /// Position of the emitter so we can compute distance to camera.
     pub translation: Vec3,
     /// The main-world entity that contains this effect.
     #[allow(dead_code)]
     pub main_entity: MainEntity,
+}
+
+impl EffectDrawBatch {
+    /// The draw an effect instance just pushed into the [`Batcher`] needs, as
+    /// the batch and the instance within it to draw, if any. `batches` is the
+    /// batcher's batch count after the push, `instances` the last batch's
+    /// instance count.
+    ///
+    /// Opaque and alpha-masked effects draw a whole batch at once, so only an
+    /// instance starting a new batch (`new_batch`) needs one. A transparent
+    /// instance always gets its own, whether it started a batch or merged into
+    /// the last one: the batch's instances can be anywhere, and one order for
+    /// all of them would draw some in front of what's in front of them.
+    pub fn for_pushed(
+        transparent: bool,
+        new_batch: Option<EffectBatchIndex>,
+        batches: usize,
+        instances: usize,
+    ) -> Option<(EffectBatchIndex, Option<usize>)> {
+        if transparent {
+            let last = batches.checked_sub(1)?;
+            let instance = instances.checked_sub(1)?;
+            Some((EffectBatchIndex(last as u32), Some(instance)))
+        } else {
+            new_batch.map(|index| (index, None))
+        }
+    }
+
+    /// The effect instances of `batch` this draws.
+    pub fn effect_data<'a>(&self, batch: &'a EffectBatch) -> &'a [BatchEffectData] {
+        match self.instance {
+            Some(index) => &batch.effect_data[index..=index],
+            None => &batch.effect_data,
+        }
+    }
 }
 
 impl EffectBatch {
@@ -847,6 +883,29 @@ mod tests {
         if let Some(parent) = parent {
             sorter.child_to_parent.insert(entity, parent);
         }
+    }
+
+    #[test]
+    fn transparent_instances_each_get_a_draw() {
+        // A transparent instance starting batch #2.
+        assert_eq!(
+            EffectDrawBatch::for_pushed(true, Some(EffectBatchIndex(2)), 3, 1),
+            Some((EffectBatchIndex(2), Some(0)))
+        );
+        // One merged into it as its third instance.
+        assert_eq!(
+            EffectDrawBatch::for_pushed(true, None, 3, 3),
+            Some((EffectBatchIndex(2), Some(2)))
+        );
+    }
+
+    #[test]
+    fn opaque_batches_draw_once() {
+        assert_eq!(
+            EffectDrawBatch::for_pushed(false, Some(EffectBatchIndex(0)), 1, 1),
+            Some((EffectBatchIndex(0), None))
+        );
+        assert_eq!(EffectDrawBatch::for_pushed(false, None, 1, 4), None);
     }
 
     #[test]
