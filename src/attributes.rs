@@ -734,6 +734,11 @@ impl AttributeInner {
         Value::Scalar(ScalarValue::Uint(0u32)),
     );
 
+    pub(crate) const SORT_KEY: &'static AttributeInner = &AttributeInner::new(
+        Cow::Borrowed("sort_key"),
+        Value::Scalar(ScalarValue::Uint(0u32)),
+    );
+
     pub(crate) const PAD0: &'static AttributeInner =
         &AttributeInner::new(Cow::Borrowed("pad0"), Value::Scalar(ScalarValue::Uint(0)));
     pub(crate) const PAD1: &'static AttributeInner =
@@ -1532,6 +1537,12 @@ impl Attribute {
         Attribute::U32_7,
         Attribute::RIBBON_ID,
     ];
+
+    /// Internal key the particles of an effect with [`SortMode::BackToFront`]
+    /// are sorted by, written each update: larger for nearer particles.
+    ///
+    /// [`SortMode::BackToFront`]: crate::SortMode::BackToFront
+    pub(crate) const SORT_KEY: Attribute = Attribute(AttributeInner::SORT_KEY);
 
     // Internal fake attributes used for padding structs.
     pub(crate) const PAD0: Attribute = Attribute(AttributeInner::PAD0);

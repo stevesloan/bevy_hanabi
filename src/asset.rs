@@ -19,9 +19,41 @@ use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
 use crate::Modifiers;
 use crate::{
     modifier::{Modifier, RenderModifier},
-    ExprHandle, ModifierContext, Module, ParticleLayout, Property, PropertyLayout, SimulationSpace,
-    SpawnerSettings, TextureLayout,
+    Attribute, ExprHandle, ModifierContext, Module, ParticleLayout, Property, PropertyLayout,
+    SimulationSpace, SpawnerSettings, TextureLayout,
 };
+
+/// Order in which the particles of an effect instance are drawn.
+///
+/// Alpha-blended particles only composite correctly when drawn from the
+/// farthest to the nearest. By default particles are drawn in the arbitrary
+/// order they are stored in, which is cheapest and fine for additive
+/// blending or sparse effects, but makes overlapping translucent particles
+/// (smoke, dust) show distant ones through near ones, and flicker as
+/// particle slots get reused.
+///
+/// Sorting happens on the GPU each frame, per effect instance, after the
+/// particle update. It does not order particles of different effect
+/// instances relative to each other; those are still sorted as a whole by
+/// the render pipeline.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect, Serialize, Deserialize)]
+pub enum SortMode {
+    /// Draw particles in storage order. This is the default.
+    #[default]
+    None,
+
+    /// Draw particles from the farthest to the nearest, by distance from the
+    /// camera tagged with [`HanabiMainCamera`]. With several views (a VR
+    /// headset's eyes, split screen), all are drawn in that one camera's
+    /// order. Without a main camera, distance is measured from the world
+    /// origin.
+    ///
+    /// Not supported together with ribbons, which are drawn in the order
+    /// they are sorted in by their `RIBBON_ID` and `AGE`.
+    ///
+    /// [`HanabiMainCamera`]: crate::HanabiMainCamera
+    BackToFront,
+}
 
 /// Type of motion integration applied to the particles of a system.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect, Serialize, Deserialize)]
@@ -321,6 +353,8 @@ pub struct EffectAsset {
     module: Module,
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
+    /// Order in which the particles of each instance are drawn.
+    pub sort_mode: SortMode,
     /// The mesh that each particle renders.
     ///
     /// The asset path must reference a [`Mesh`] asset. If `None`, the effect
@@ -453,6 +487,14 @@ impl EffectAsset {
     /// Set the effect's motion integration.
     pub fn with_motion_integration(mut self, motion_integration: MotionIntegration) -> Self {
         self.motion_integration = motion_integration;
+        self
+    }
+
+    /// Set the order in which the particles of each instance are drawn.
+    ///
+    /// See [`SortMode`] for details.
+    pub fn with_sort_mode(mut self, sort_mode: SortMode) -> Self {
+        self.sort_mode = sort_mode;
         self
     }
 
@@ -614,6 +656,10 @@ impl EffectAsset {
         // modifiers, but may not have been added directly yet.
         self.module.gather_attributes(&mut set);
 
+        if self.sort_mode == SortMode::BackToFront {
+            set.insert(Attribute::SORT_KEY);
+        }
+
         // Build the layout
         let mut layout = ParticleLayout::new();
         for attr in set {
@@ -723,7 +769,7 @@ impl bevy::reflect::serde::SerializeWithRegistry for EffectAsset {
     {
         use serde::ser::SerializeStruct as _;
 
-        let mut s = serializer.serialize_struct("EffectAsset", 14)?;
+        let mut s = serializer.serialize_struct("EffectAsset", 15)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("capacity", &self.capacity)?;
         s.serialize_field("spawner", &self.spawner)?;
@@ -746,6 +792,7 @@ impl bevy::reflect::serde::SerializeWithRegistry for EffectAsset {
         s.serialize_field("motion_integration", &self.motion_integration)?;
         s.serialize_field("module", &self.module)?;
         s.serialize_field("alpha_mode", &self.alpha_mode)?;
+        s.serialize_field("sort_mode", &self.sort_mode)?;
         s.serialize_field("mesh", &self.mesh)?;
         s.end()
     }
@@ -773,6 +820,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
             MotionIntegration,
             Module,
             AlphaMode,
+            SortMode,
             Mesh,
         }
 
@@ -811,6 +859,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                 let mut motion_integration = None;
                 let mut module = None;
                 let mut alpha_mode = None;
+                let mut sort_mode = None;
                 let mut mesh = None;
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -911,6 +960,12 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                             }
                             alpha_mode = Some(map.next_value()?);
                         }
+                        Field::SortMode => {
+                            if sort_mode.is_some() {
+                                return Err(serde::de::Error::duplicate_field("sort_mode"));
+                            }
+                            sort_mode = Some(map.next_value()?);
+                        }
                         Field::Mesh => {
                             if mesh.is_some() {
                                 return Err(serde::de::Error::duplicate_field("mesh"));
@@ -938,6 +993,8 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                 let module = module.ok_or_else(|| serde::de::Error::missing_field("module"))?;
                 let alpha_mode =
                     alpha_mode.ok_or_else(|| serde::de::Error::missing_field("alpha_mode"))?;
+                // Optional, so assets serialized before it existed still load.
+                let sort_mode = sort_mode.unwrap_or_default();
                 let mesh = mesh.ok_or_else(|| serde::de::Error::missing_field("mesh"))?;
                 // Modifiers uses ReflectModifier type data to construct a
                 // concrete type. So we can directly try_take()
@@ -974,6 +1031,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
                     motion_integration,
                     module,
                     alpha_mode,
+                    sort_mode,
                     mesh,
                 })
             }
@@ -993,6 +1051,7 @@ impl<'de> bevy::reflect::serde::DeserializeWithRegistry<'de> for EffectAsset {
             "motion_integration",
             "module",
             "alpha_mode",
+            "sort_mode",
             "mesh",
         ];
         deserializer.deserialize_struct(
@@ -1332,6 +1391,7 @@ mod tests {
             prng_seed: 4284,
             motion_integration: MotionIntegration::PreUpdate,
             alpha_mode: AlphaMode::Multiply,
+            sort_mode: SortMode::BackToFront,
             ..Default::default()
         }
         .init(mod_pos);
@@ -1345,6 +1405,12 @@ mod tests {
         eprintln!("{}", s);
         let effect_serde = EffectAsset::deserialize(&s, &registry).unwrap();
 
+        // Assets serialized before `sort_mode` existed still load, unsorted.
+        let without_sort_mode = s.replace("sort_mode: BackToFront,", "");
+        assert_ne!(without_sort_mode, s);
+        let effect_old = EffectAsset::deserialize(&without_sort_mode, &registry).unwrap();
+        assert_eq!(effect_old.sort_mode, SortMode::None);
+
         assert_eq!(effect.name, effect_serde.name);
         assert_eq!(effect.capacity, effect_serde.capacity);
         assert_eq!(effect.spawner, effect_serde.spawner);
@@ -1357,6 +1423,7 @@ mod tests {
         assert_eq!(effect.motion_integration, effect_serde.motion_integration);
         assert_eq!(effect.module, effect_serde.module);
         assert_eq!(effect.alpha_mode, effect_serde.alpha_mode);
+        assert_eq!(effect.sort_mode, effect_serde.sort_mode);
         assert_eq!(
             effect.init_modifiers().count(),
             effect_serde.init_modifiers().count()
