@@ -211,6 +211,7 @@ mod test_utils;
 pub use asset::{
     AlphaMode, DefaultMesh, EffectAsset, EffectAssetDeserializer, EffectAssetLoader,
     EffectAssetSerializer, EffectParent, MotionIntegration, SimulationCondition, SortMode,
+    MAX_DEPTH_SLICE_EDGES,
 };
 pub use attributes::*;
 pub use gradient::{Gradient, GradientKey};
@@ -1227,6 +1228,27 @@ impl EffectShaderSources {
                 Attribute::RIBBON_ID.name().to_ascii_uppercase(),
                 asset.sort_mode
             )));
+        }
+
+        if !asset.depth_slices.is_empty() {
+            let edges = &asset.depth_slices;
+            let problem = if asset.sort_mode != SortMode::BackToFront {
+                Some("they require sort_mode SortMode::BackToFront".to_string())
+            } else if edges.len() > MAX_DEPTH_SLICE_EDGES {
+                Some(format!("at most {MAX_DEPTH_SLICE_EDGES} edges are supported"))
+            } else if !edges.iter().all(|edge| edge.is_finite() && *edge > 0.0)
+                || edges.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                Some("the edges must be positive and ascending".to_string())
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                return Err(ShaderGenerateError::Validate(format!(
+                    "The asset '{}' has depth slices {:?}, but {}.",
+                    asset.name, edges, problem
+                )));
+            }
         }
 
         // Generate the WGSL code declaring all the attributes inside the
@@ -2795,6 +2817,34 @@ else { return c1; }
         assert!(!asset.particle_layout().contains(Attribute::SORT_KEY));
         let sources = EffectShaderSources::generate(&asset, None, 0).unwrap();
         assert!(!sources.layout_flags.needs_sort());
+
+        // Depth slices: valid only when sorted, with positive ascending
+        // edges, at most MAX_DEPTH_SLICE_EDGES.
+        let sliced = |sort_mode, edges: &[f32]| {
+            let mut module = Module::default();
+            let zero = module.lit(Vec3::ZERO);
+            let asset = EffectAsset::new(256, SpawnerSettings::rate(32.0.into()), module)
+                .with_sort_mode(sort_mode)
+                .with_depth_slices(edges)
+                .init(SetAttributeModifier::new(Attribute::POSITION, zero));
+            EffectShaderSources::generate(&asset, None, 0).map(|_| ())
+        };
+        assert!(sliced(SortMode::BackToFront, &[4.0, 10.0, 25.0]).is_ok());
+        assert!(sliced(SortMode::BackToFront, &[]).is_ok());
+        assert!(sliced(SortMode::None, &[]).is_ok());
+        for (sort_mode, edges) in [
+            (SortMode::None, &[4.0, 10.0][..]),
+            (SortMode::BackToFront, &[10.0, 4.0][..]),
+            (SortMode::BackToFront, &[4.0, 4.0][..]),
+            (SortMode::BackToFront, &[0.0, 4.0][..]),
+            (SortMode::BackToFront, &[4.0, f32::INFINITY][..]),
+            (SortMode::BackToFront, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..]),
+        ] {
+            assert!(
+                matches!(sliced(sort_mode, edges), Err(ShaderGenerateError::Validate(_))),
+                "{sort_mode:?} {edges:?}"
+            );
+        }
 
         // Ribbons are drawn in ribbon order, so can't also be sorted.
         let mut module = Module::default();

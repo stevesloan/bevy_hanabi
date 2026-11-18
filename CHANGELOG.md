@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nearest from the `HanabiMainCamera`, so overlapping alpha-blended particles composite
   correctly. The default `SortMode::None` keeps the previous unsorted order. Not supported
   together with ribbons.
+- Added `EffectAsset::with_depth_slices()` (`EffectAsset::depth_slices`). An effect sorted
+  with `SortMode::BackToFront` can be drawn in 3D as one transparent item per band of distance
+  from the camera, each ordered at its band's middle, so other transparent objects inside a
+  widespread effect are ordered against the nearby particles rather than the whole effect.
 
 ## [0.20.0] 2026-11-01
 

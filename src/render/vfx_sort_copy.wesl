@@ -29,7 +29,7 @@ struct MergeParams {
 @group(0) @binding(1) var<storage, read> sort_buffer : SortBuffer;
 // Technically read-only, but the type contains atomic<> fields and wasm is strict about it
 @group(0) @binding(2) var<storage, read_write> effect_metadatas : array<EffectMetadata>;
-@group(0) @binding(3) var<storage, read> spawner : Spawner;
+@group(0) @binding(3) var<storage, read_write> spawner : Spawner;
 @group(0) @binding(4) var<storage, read> merge_params : MergeParams;
 
 /// Copy the sorted particle indices back into the effect index buffer.
@@ -51,4 +51,29 @@ fn sort_copy(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let source_offset = merge_params.source_buffer * u32(sort_buffer.count);
     let particle_index = sort_buffer.pairs[source_offset + row_index].value;
     indirect_index_buffer.data[(base_particle + row_index) * 3u + write_index] = particle_index;
+
+    // Depth slices: rows are sorted farthest first, so each edge splits them
+    // once. The row just before that split records it; if every row is
+    // nearer than an edge, the first row does.
+    let edge_count = spawner.depth_slice_count;
+    if (edge_count == 0u) {
+        return;
+    }
+    // The back-to-front sort key is the distance's bits, inverted.
+    let distance = bitcast<f32>(~sort_buffer.pairs[source_offset + row_index].key);
+    var next_distance = -1.0;
+    if (row_index + 1u < count) {
+        next_distance = bitcast<f32>(~sort_buffer.pairs[source_offset + row_index + 1u].key);
+    }
+    for (var edge = 0u; edge < edge_count; edge += 1u) {
+        let at = spawner.depth_slice_edges[edge];
+        if (distance >= at && next_distance < at) {
+            spawner.depth_slice_rows[edge] = row_index + 1u;
+        } else if (row_index == 0u && distance < at) {
+            spawner.depth_slice_rows[edge] = 0u;
+        }
+    }
+    if (row_index == 0u) {
+        spawner.depth_slice_rows[edge_count] = count;
+    }
 }
