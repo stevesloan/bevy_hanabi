@@ -170,7 +170,10 @@ impl SortBindGroups {
     ///
     /// This includes the header 'count:u32' field, as well as up to 2 copies of
     /// the 'pairs' array (used for ping-pong during sorting). This allows
-    /// sorting up to ~131k particles.
+    /// sorting up to ~131k particles; [`ensure_sort_capacity()`] grows it for
+    /// a sorted effect with a larger capacity.
+    ///
+    /// [`ensure_sort_capacity()`]: Self::ensure_sort_capacity
     pub const SORT_BUFFER_BYTE_SIZE: u32 = 3 * 1024 * 1024;
 
     /// Size in elements of a sort block.
@@ -347,6 +350,39 @@ impl SortBindGroups {
 
     /// Ensure the mergesort params are allocated for all passes to process a
     /// given number of blocks.
+    /// Grow the sort buffer to hold `num_items` pairs twice over, for the
+    /// ping-pong of the merge passes, if it's smaller. The bind groups made
+    /// with the old buffer are dropped, to be made again with the new one.
+    pub fn ensure_sort_capacity(&mut self, render_device: &RenderDevice, num_items: u32) {
+        // Dual-key pairs, the largest.
+        let pair_size = 12;
+        let wanted = 4 + 2 * pair_size * num_items as u64;
+        if wanted <= self.sort_buffer.size() {
+            return;
+        }
+        let max = render_device.limits().max_storage_buffer_binding_size;
+        if wanted > max {
+            bevy::log::error!(
+                "Can't sort {num_items} particles: the sort buffer would be {wanted} bytes, \
+                 past the device's {max}-byte storage binding limit. Particles past {} won't \
+                 be in order.",
+                (max - 4) / (2 * pair_size)
+            );
+        }
+        let size = wanted.min(max).next_multiple_of(4);
+        bevy::log::debug!("Growing the sort buffer to {size} bytes for {num_items} particles");
+        self.sort_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("hanabi:buffer:sort:pairs"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.sort_fill_bind_groups.clear();
+        self.sort_bind_group = None;
+        self.sort_merge_bind_group = None;
+        self.sort_copy_bind_groups.clear();
+    }
+
     pub fn ensure_mergesort_passes(&mut self, num_items: u32) {
         let num_blocks = num_items.div_ceil(Self::BLOCK_SIZE);
         if num_blocks <= 1 {
@@ -1395,8 +1431,8 @@ mod gpu_tests {
             })
             .collect::<Vec<_>>();
 
-        // Dispatch to GPU
-        let workgroups = [UVec3::new(1, 1, 1); 2];
+        // Dispatch to GPU, a thread per item
+        let workgroups = [UVec3::new(num_particle.div_ceil(64), 1, 1); 2];
         let view = test.dispatch(
             "merge_sort",
             num_particle,
@@ -1417,6 +1453,58 @@ mod gpu_tests {
         let s = format_slice(&view_slice[num_particle as usize..]);
         eprintln!("scratch:\n{s}");
         assert_eq!(&view_slice[..num_particle as usize], expected.as_slice());
+    }
+
+    /// Many lists of 1024 and an unpaired last one, through every pass:
+    /// globally sorted, equal keys in their original order.
+    #[test]
+    fn test_merge_many_passes() {
+        let mut test = MergeTest::new();
+        let num_particle = 9000_u32;
+        let block = 1024_u32;
+
+        // Sorted blocks, as the block sort leaves them, with repeated keys.
+        let mut values: Vec<DualKeyValuePair> = (0..num_particle)
+            .map(|i| DualKeyValuePair {
+                key: (i.wrapping_mul(2654435761) >> 20) % 97,
+                key2: 0.0,
+                value: i,
+            })
+            .collect();
+        for chunk in values.chunks_mut(block as usize) {
+            chunk.sort_by_key(|kv| kv.key);
+        }
+        let dummy = DualKeyValuePair {
+            key: u32::MAX,
+            key2: f32::INFINITY,
+            value: u32::MAX,
+        };
+        values.extend((0..num_particle).map(|_| dummy));
+
+        let num_blocks = num_particle.div_ceil(block);
+        let num_passes = 32 - (num_blocks - 1).leading_zeros();
+        let merge_params = (0..num_passes)
+            .map(|i| GpuMergeParams {
+                max_list_size: block << i,
+                source_buffer: i % 2,
+            })
+            .collect::<Vec<_>>();
+        let workgroups = vec![UVec3::new(num_particle.div_ceil(64), 1, 1); num_passes as usize];
+        let view = test.dispatch(
+            "merge_sort",
+            num_particle,
+            &values[..],
+            &merge_params[..],
+            &workgroups,
+        );
+
+        let all: &[DualKeyValuePair] = cast_slice(&view[4..]);
+        let half = (num_passes % 2) as usize * num_particle as usize;
+        let sorted = &all[half..half + num_particle as usize];
+        let mut expected = values[..num_particle as usize].to_vec();
+        // Stable: equal keys keep the order the blocks had them in.
+        expected.sort_by_key(|kv| kv.key);
+        assert_eq!(sorted, expected.as_slice());
     }
 
     /// Helper for all GPU merge tests.

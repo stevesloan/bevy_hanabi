@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The particle sort's merge passes are parallel: one thread per particle, each placed
+  by binary search, rather than one thread walking each pair of lists. Sorting ~100k
+  particles drops from tens of milliseconds of GPU time to under one.
+- The sort buffer grows to the largest sorted effect's capacity, where it was fixed at
+  room for 131,072 particles and a larger sorted effect drew in no order.
 - Fixed effects sharing a texture layout drawing with each other's textures: the cached bind
   group binding an effect's material was keyed by its texture layout but not its textures, so
   the first effect created with a layout lent its textures to every later effect with the same
