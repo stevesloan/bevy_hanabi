@@ -214,11 +214,27 @@ fn vertex(
 
     // A depth slice band's draw has its band's instance count. Sorted rows
     // run farthest first, and band b, from the nearest, starts where edge b
-    // splits them (the farthest band at the start).
+    // splits them (the farthest band at the start) and ends where edge b - 1
+    // does (the count before the first edge). Direct draws cover every slot,
+    // so cull past the band's end.
     var row = instance_index;
     let slice = batch_info.depth_slice;
-    if (slice < (*spawner).depth_slice_count) {
-        row += (*spawner).depth_slice_rows[slice];
+    let edge_count = (*spawner).depth_slice_count;
+    if (slice <= edge_count) {
+        var start = 0u;
+        if (slice < edge_count) {
+            start = (*spawner).depth_slice_rows[slice];
+        }
+        var end = (*spawner).depth_slice_rows[edge_count];
+        if (slice > 0u) {
+            end = (*spawner).depth_slice_rows[slice - 1u];
+        }
+        if (instance_index >= end - min(start, end)) {
+            var culled: VertexOutput;
+            culled.position = vec4(0.0);
+            return culled;
+        }
+        row = start + instance_index;
     }
 
     // Fetch particle
