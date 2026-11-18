@@ -486,10 +486,7 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
         );
         let first_index = if self.free_indices.is_empty() {
             let index = self.active_count;
-            if index == self.capacity {
-                self.capacity += count;
-            }
-            debug_assert!(index < self.capacity);
+            self.capacity = self.capacity.max(index + count);
             self.active_count += count;
             index
         } else {
@@ -508,6 +505,7 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
                     // non-contiguous; restart a new sequence
                     debug_assert!(n < count);
                     s = i;
+                    n = 1;
                 }
                 i += 1;
             }
@@ -520,10 +518,7 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
                 // No free range for 'count' consecutive entries. Allocate at
                 // end instead.
                 let index = self.active_count;
-                if index == self.capacity {
-                    self.capacity += count;
-                }
-                debug_assert!(index < self.capacity);
+                self.capacity = self.capacity.max(index + count);
                 self.active_count += count;
                 index
             }
@@ -1088,6 +1083,28 @@ mod tests {
         table.remove_range(id7, 2);
         assert_eq!(table.active_count, 2);
         assert!(table.free_indices.is_empty());
+    }
+
+    #[test]
+    fn buffer_table_insert_contiguous_skips_short_runs() {
+        let mut table =
+            BufferTable::<GpuDummy>::new(BufferUsages::STORAGE, NonZeroU64::new(32), None);
+        let ids: Vec<_> = (0..8).map(|_| table.insert(GpuDummy::default())).collect();
+
+        // [x - - x x - - x]
+        for i in [1, 2, 5, 6] {
+            table.remove(ids[i]);
+        }
+        // Neither free run holds three rows, so they go at the end.
+        let id = table.insert_contiguous([GpuDummy::default(); 3].into_iter());
+        assert_eq!(id.0, 8);
+        assert_eq!(table.active_count, 11);
+        assert_eq!(table.capacity, 11);
+        assert_eq!(table.free_indices, [1, 2, 5, 6]);
+
+        let id = table.insert_contiguous([GpuDummy::default(); 2].into_iter());
+        assert_eq!(id.0, 1);
+        assert_eq!(table.free_indices, [5, 6]);
     }
 }
 

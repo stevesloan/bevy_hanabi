@@ -370,7 +370,13 @@ fn real_ribbon_sort_chain_isolated_per_instance() -> Result<(), Box<dyn std::err
             storage(2, false, false),
             storage(3, false, true),
             storage(4, true, true),
+            storage(5, false, false),
         ],
+    });
+    let draw_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:ribbon:draw"),
+        contents: cast_slice(&[GpuDrawIndexedIndirectArgs::default()]),
+        usage: wgpu::BufferUsages::STORAGE,
     });
     let fill_bg = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hanabi:test:ribbon:fill:bg"),
@@ -429,6 +435,10 @@ fn real_ribbon_sort_chain_isolated_per_instance() -> Result<(), Box<dyn std::err
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: copy_source_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: draw_buffer.as_entire_binding(),
             },
         ],
     });
@@ -557,8 +567,10 @@ fn real_ribbon_sort_chain_isolated_per_instance() -> Result<(), Box<dyn std::err
 
 /// Sort the particles at `distances` back-to-front through the real
 /// sort-fill, sort and sort-copy shaders, with the given depth slice edges;
-/// the spawner's resulting `depth_slice_rows` and the sorted particle indices.
-fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
+/// the spawner's resulting `depth_slice_rows`, the sorted particle indices,
+/// and the instance counts of the draw args after the effect's (one per band,
+/// then one more which mustn't be written).
+fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, Vec<u32>) {
     let renderer = MockRenderer::new();
     let device = renderer.device();
     let queue = renderer.queue();
@@ -590,7 +602,10 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
         sort_key2_offset: 0,
         ..default()
     };
+    // Past another effect's args, to catch indexing from the buffer's start.
+    const DRAW_INDEX: u32 = 2;
     let mut spawner = GpuSpawnerParams {
+        draw_indirect_index: DRAW_INDEX,
         depth_slice_count: edges.len() as u32,
         ..default()
     };
@@ -631,6 +646,21 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
         size: 4 + 12 * count as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    // Band counts zeroed, as the indirect pass leaves them; the effect's own
+    // and the rows around them hold a marker.
+    let band_rows = DRAW_INDEX + 1..DRAW_INDEX + 1 + batch::depth_slice_bands(edges);
+    let draw_args: Vec<GpuDrawIndexedIndirectArgs> = (0..band_rows.end + 1)
+        .map(|row| GpuDrawIndexedIndirectArgs {
+            index_count: 6,
+            instance_count: if band_rows.contains(&row) { 0 } else { 77 },
+            ..default()
+        })
+        .collect();
+    let draw_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:draw"),
+        contents: cast_slice(&draw_args),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     });
     let dispatch_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("hanabi:test:slices:dispatch"),
@@ -673,9 +703,12 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
             storage(2, false, false),
             storage(3, false, true),
             storage(4, true, true),
+            storage(5, false, false),
         ],
     });
-    fn entries<'a>(resources: [wgpu::BindingResource<'a>; 5]) -> Vec<wgpu::BindGroupEntry<'a>> {
+    fn entries<'a, const N: usize>(
+        resources: [wgpu::BindingResource<'a>; N],
+    ) -> Vec<wgpu::BindGroupEntry<'a>> {
         resources
             .into_iter()
             .enumerate()
@@ -705,6 +738,7 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
             metadata_buffer.as_entire_binding(),
             spawner_binding(),
             copy_source_buffer.as_entire_binding(),
+            draw_buffer.as_entire_binding(),
         ]),
     });
     let pipeline = |label, bgl: &wgpu::BindGroupLayout, module, entry_point| {
@@ -760,31 +794,49 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>) {
         (indirect_indices.len() * size_of::<u32>()) as u64,
     );
     let sorted = indirect_out.chunks(3).map(|row| row[0]).collect();
-    (spawner_out.depth_slice_rows, sorted)
+    let draw_out = readback_vec::<GpuDrawIndexedIndirectArgs>(
+        &device,
+        &queue,
+        &draw_buffer,
+        (draw_args.len() * size_of::<GpuDrawIndexedIndirectArgs>()) as u64,
+    );
+    assert!(draw_out.iter().all(|args| args.index_count == 6));
+    assert_eq!(draw_out[DRAW_INDEX as usize].instance_count, 77);
+    let band_counts = draw_out[band_rows.start as usize..]
+        .iter()
+        .map(|args| args.instance_count)
+        .collect();
+    (spawner_out.depth_slice_rows, sorted, band_counts)
 }
 
 #[test]
 fn real_sort_copy_finds_depth_slice_rows() {
     // Sorted farthest first: 30, 12, 7, 5, 3, 1.
     let distances = [1.0, 3.0, 5.0, 12.0, 30.0, 7.0];
-    let (rows, sorted) = sort_depth_slices(&distances, &[4.0, 10.0, 25.0]);
+    let (rows, sorted, bands) = sort_depth_slices(&distances, &[4.0, 10.0, 25.0]);
     assert_eq!(sorted, [4, 3, 5, 2, 1, 0]);
     // At least 4 m: four particles; 10 m: two; 25 m: one; six in all.
     assert_eq!(&rows[..4], &[4, 2, 1, 6]);
+    // Nearest first: 3 and 1; 7 and 5; 12; 30.
+    assert_eq!(bands, [2, 2, 1, 1, 77]);
 
     // Every particle nearer than every edge, or beyond them.
-    let (rows, _) = sort_depth_slices(&distances, &[50.0, 60.0]);
+    let (rows, _, bands) = sort_depth_slices(&distances, &[50.0, 60.0]);
     assert_eq!(&rows[..3], &[0, 0, 6]);
-    let (rows, _) = sort_depth_slices(&distances, &[0.5]);
+    assert_eq!(bands, [6, 0, 0, 77]);
+    let (rows, _, bands) = sort_depth_slices(&distances, &[0.5]);
     assert_eq!(&rows[..2], &[6, 6]);
+    assert_eq!(bands, [0, 6, 77]);
 
     // A particle exactly at an edge is in the band beyond it.
-    let (rows, _) = sort_depth_slices(&distances, &[5.0]);
+    let (rows, _, bands) = sort_depth_slices(&distances, &[5.0]);
     assert_eq!(&rows[..2], &[4, 6]);
+    assert_eq!(bands, [2, 4, 77]);
 
-    // Without slices the rows are left alone.
-    let (rows, _) = sort_depth_slices(&distances, &[]);
+    // Without slices nothing is written.
+    let (rows, _, bands) = sort_depth_slices(&distances, &[]);
     assert_eq!(rows, [99; 8]);
+    assert_eq!(bands, [77]);
 }
 
 #[test]

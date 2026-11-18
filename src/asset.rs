@@ -523,8 +523,7 @@ impl EffectAsset {
     /// positive and ascending, at most [`MAX_DEPTH_SLICE_EDGES`] of them.
     /// Slices are only drawn separately in 3D.
     ///
-    /// Each band is its own draw call over the instance's particles, so the
-    /// vertex shader runs once per particle per band.
+    /// Each band is its own indirect draw call, over only its particles.
     pub fn with_depth_slices(mut self, edges: impl Into<Vec<f32>>) -> Self {
         self.depth_slices = edges.into();
         self

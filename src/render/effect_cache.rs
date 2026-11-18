@@ -709,6 +709,10 @@ impl From<GpuDrawIndexedIndirectArgs> for AnyDrawIndirectArgs {
 pub(crate) struct CachedDrawIndirectArgs {
     pub row: BufferTableId,
     pub args: AnyDrawIndirectArgs,
+    /// Depth slice bands drawn from the rows after [`row`](Self::row), one
+    /// each, nearest first; their instance counts are written by the
+    /// sort-copy pass.
+    pub bands: u32,
 }
 
 impl Default for CachedDrawIndirectArgs {
@@ -716,6 +720,7 @@ impl Default for CachedDrawIndirectArgs {
         Self {
             row: BufferTableId::INVALID,
             args: AnyDrawIndirectArgs::NonIndexed(default()),
+            bands: 0,
         }
     }
 }
