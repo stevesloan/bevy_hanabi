@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-
+- Added `SortMode` and `EffectAsset::sort_mode`. With `SortMode::BackToFront`, the particles
+  of each effect instance are sorted on the GPU each frame to be drawn from the farthest to the
+  nearest from the `HanabiMainCamera`, so overlapping alpha-blended particles composite
+  correctly. The default `SortMode::None` keeps the previous unsorted order. Not supported
+  together with ribbons.
+- Added `EffectSortPoint`, an optional component setting the world-space point an
+  effect is ordered by among other transparent objects, in place of its origin.
+  For effects whose particles spread far from their emitter, like a trail left
+  in global space.
 
 ### Fixed
 

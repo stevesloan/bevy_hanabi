@@ -1115,9 +1115,6 @@ pub struct EffectMesh(pub Handle<Mesh>);
 /// the particles are, if they spread far from the origin: a trail simulated in
 /// [`SimulationSpace::Global`] behind a moving emitter at the centre of its
 /// bounds, for example, so that what's beyond the trail draws behind it.
-///
-/// Effect instances batched into a single draw call are ordered by the first
-/// instance's point.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Component, Reflect)]
 #[reflect(Component)]
 pub struct EffectSortPoint(pub Vec3);
