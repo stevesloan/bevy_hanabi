@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- New particles are seeded by their index in the frame's spawn, not by the slot they take.
+  Threads race for slots, and which are free depends on the order earlier particles died, so
+  the same effect gave different random draws, and different frames, on every run.
 - `BufferTable::remove()` drops the free rows it leaves at the end of the table, as
   `remove_range()` does. A table freed by both failed `remove_range()`'s check.
 - The particle sort's merge passes are parallel: one thread per particle, each placed

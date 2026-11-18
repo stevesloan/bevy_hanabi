@@ -155,8 +155,11 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     // store it in a variable, because the INIT_CODE might access it.
     let particle_counter = atomicAdd(&(*effect_metadata).particle_counter, 1u);
 
-    // Initialize the PRNG seed
-    seed = pcg_hash(particle_index ^ (*spawner).seed);
+    // Initialize the PRNG seed. From the particle's index in this frame's
+    // spawn rather than the slot it took: threads race for slots, and which
+    // ones are free depends on the order earlier particles died, so seeding
+    // by slot gives a different run every time.
+    seed = pcg_hash(location.update_index ^ (*spawner).seed);
 
     // Spawner transform
     let transform = transpose(
