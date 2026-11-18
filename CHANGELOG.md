@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `BufferTable::remove()` drops the free rows it leaves at the end of the table, as
+  `remove_range()` does. A table freed by both failed `remove_range()`'s check.
 - The particle sort's merge passes are parallel: one thread per particle, each placed
   by binary search, rather than one thread walking each pair of lists. Sorting ~100k
   particles drops from tens of milliseconds of GPU time to under one.

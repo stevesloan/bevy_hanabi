@@ -554,26 +554,13 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
     }
 
     /// Remove a row from the table.
+    ///
+    /// As a range of one, so the free rows it leaves at the end of the active
+    /// zone are dropped too: a table freed by both would otherwise hold more
+    /// free rows than [`Self::remove_range()`] allows.
     #[allow(dead_code)]
     pub fn remove(&mut self, id: BufferTableId) {
-        let index = id.0;
-        assert!(index < self.active_count);
-
-        // If this is the last item in the active zone, just shrink the active
-        // zone (implicit free list).
-        if index == self.active_count - 1 {
-            self.active_count -= 1;
-            self.capacity -= 1;
-        } else {
-            // This is very inefficient but we need to apply the same logic as
-            // the EffectCache because we rely on indices being in
-            // sync.
-            let pos = self
-                .free_indices
-                .binary_search(&index) // will fail
-                .unwrap_or_else(|e| e); // will get position of insertion
-            self.free_indices.insert(pos, index);
-        }
+        self.remove_range(id, 1);
     }
 
     /// Remove a range of rows from the table.
@@ -997,6 +984,29 @@ mod tests {
             assert!(!table.is_empty());
             assert_eq!(table.len(), 1);
         }
+    }
+
+    /// Removing the last row one at a time leaves no free rows at the end,
+    /// as removing a range does: a sliced effect's draw args are freed as a
+    /// range from the same table, which checks that.
+    #[test]
+    fn remove_last_row_drops_the_free_rows_before_it() {
+        let mut table =
+            BufferTable::<GpuDummy>::new(BufferUsages::STORAGE, NonZeroU64::new(32), None);
+        let a = table.insert(GpuDummy::default());
+        let b = table.insert(GpuDummy::default());
+        let c = table.insert(GpuDummy::default());
+
+        // [x - x] then [x]
+        table.remove(b);
+        table.remove(c);
+        assert_eq!(table.active_count, 1);
+        assert!(table.free_indices.is_empty());
+
+        // Which used to fail its check with [- -] left active.
+        table.remove_range(a, 1);
+        assert_eq!(table.active_count, 0);
+        assert!(table.free_indices.is_empty());
     }
 
     #[test]
