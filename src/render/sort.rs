@@ -26,7 +26,10 @@ use wgpu::{
 
 use super::{gpu_buffer::GpuBuffer, GpuDispatchIndirectArgs, GpuEffectMetadata, StorageType};
 use crate::{
-    render::{aligned_buffer_vec::AlignedBufferVec, GpuIndirectIndex, GpuSpawnerParams},
+    render::{
+        aligned_buffer_vec::AlignedBufferVec, GpuDrawIndexedIndirectArgs, GpuIndirectIndex,
+        GpuSpawnerParams,
+    },
     Attribute, ParticleLayout,
 };
 
@@ -93,6 +96,7 @@ struct SortCopyBindGroupKey {
     // Bound at binding 3 with a per-effect dynamic offset; reallocates as
     // effects grow, so it must be keyed or a stale buffer overruns the offset.
     spawner: BufferId,
+    draw_indirect: BufferId,
 }
 
 /// GPU representation of a single dual-key value pair, with the added buffer
@@ -291,6 +295,9 @@ impl SortBindGroups {
                     storage_buffer_sized(true, Some(GpuSpawnerParams::aligned_size(alignment))),
                     // @group(0) @binding(4) var<storage, read> merge_params : MergeParams;
                     storage_buffer_read_only_sized(true, Some(GpuMergeParams::SHADER_SIZE)),
+                    // @group(0) @binding(5) var<storage, read_write> draw_indirect_buffer :
+                    // array<DrawIndexedIndirectArgs>;
+                    storage_buffer::<GpuDrawIndexedIndirectArgs>(false),
                 ),
             ),
         );
@@ -712,6 +719,7 @@ impl SortBindGroups {
         indirect_index_buffer: &Buffer,
         effect_metadata_buffer: &Buffer,
         spawner_buffer: &Buffer,
+        draw_indirect_buffer: &Buffer,
         pipeline_cache: &PipelineCache,
     ) -> Result<&BindGroup, ()> {
         let key = SortCopyBindGroupKey {
@@ -719,6 +727,7 @@ impl SortBindGroups {
             sort: self.sort_buffer.id(),
             effect_metadata: effect_metadata_buffer.id(),
             spawner: spawner_buffer.id(),
+            draw_indirect: draw_indirect_buffer.id(),
         };
         let entry = self.sort_copy_bind_groups.entry(key);
         let bind_group = match entry {
@@ -746,6 +755,9 @@ impl SortBindGroups {
                         },
                         // @group(0) @binding(4) var<storage, read> merge_params : MergeParams;
                         self.merge_params_buffer.range_binding(0, 1).unwrap(),
+                        // @group(0) @binding(5) var<storage, read_write> draw_indirect_buffer :
+                        // array<DrawIndexedIndirectArgs>;
+                        draw_indirect_buffer.as_entire_binding(),
                     )),
                 ))
             }
@@ -758,12 +770,14 @@ impl SortBindGroups {
         indirect_index: BufferId,
         effect_metadata: BufferId,
         spawner: BufferId,
+        draw_indirect: BufferId,
     ) -> Option<&BindGroup> {
         let key = SortCopyBindGroupKey {
             indirect_index,
             sort: self.sort_buffer.id(),
             effect_metadata,
             spawner,
+            draw_indirect,
         };
         self.sort_copy_bind_groups.get(&key)
     }

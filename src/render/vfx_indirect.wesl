@@ -48,6 +48,13 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let draw_indirect_index = (*spawner).draw_indirect_index;
     let dri_base = DRAW_INDEXED_INDIRECT_STRIDE * draw_indirect_index;
     draw_indirect_buffer[dri_base + 1u] = 0u;
+    // And of each depth slice band's draw, which the sort-copy pass fills.
+    let edge_count = (*spawner).depth_slice_count;
+    if (edge_count > 0u) {
+        for (var band = 1u; band <= edge_count + 1u; band += 1u) {
+            draw_indirect_buffer[dri_base + DRAW_INDEXED_INDIRECT_STRIDE * band + 1u] = 0u;
+        }
+    }
 
     let capacity = effect_metadatas[effect_metadata_index].capacity;
     let alive_count = atomicLoad(&effect_metadatas[effect_metadata_index].alive_count); // atomic not needed

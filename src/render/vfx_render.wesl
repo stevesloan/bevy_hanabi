@@ -212,27 +212,13 @@ fn vertex(
     effect_metadata_index = (*spawner).effect_metadata_index;
     let base_particle = effect_location.base_particle;
 
-    // A depth slice's draw covers its band's range of the sorted particles,
-    // which are sorted farthest first: band b, from the nearest, is the rows
-    // at least as far as edge b-1 but not edge b.
+    // A depth slice band's draw has its band's instance count. Sorted rows
+    // run farthest first, and band b, from the nearest, starts where edge b
+    // splits them (the farthest band at the start).
     var row = instance_index;
     let slice = batch_info.depth_slice;
-    if (slice != 0xFFFFFFFFu) {
-        let edge_count = (*spawner).depth_slice_count;
-        var start = 0u;
-        if (slice < edge_count) {
-            start = (*spawner).depth_slice_rows[slice];
-        }
-        var end = (*spawner).depth_slice_rows[edge_count];
-        if (slice > 0u) {
-            end = (*spawner).depth_slice_rows[slice - 1u];
-        }
-        if (instance_index >= end - min(start, end)) {
-            var culled: VertexOutput;
-            culled.position = vec4(0.0);
-            return culled;
-        }
-        row = start + instance_index;
+    if (slice < (*spawner).depth_slice_count) {
+        row += (*spawner).depth_slice_rows[slice];
     }
 
     // Fetch particle

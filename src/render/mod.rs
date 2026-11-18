@@ -3214,23 +3214,37 @@ impl EffectsMeta {
     pub fn allocate_draw_indirect(
         &mut self,
         draw_args: &AnyDrawIndirectArgs,
+        bands: u32,
     ) -> CachedDrawIndirectArgs {
-        let row = self
-            .draw_indirect_args_buffer
-            .insert(draw_args.bitcast_to_row_entry());
+        let entry = draw_args.bitcast_to_row_entry();
+        let row = if bands == 0 {
+            self.draw_indirect_args_buffer.insert(entry)
+        } else {
+            self.draw_indirect_args_buffer
+                .insert_contiguous(std::iter::repeat_n(entry, 1 + bands as usize))
+        };
         CachedDrawIndirectArgs {
             row,
             args: *draw_args,
+            bands,
         }
     }
 
     pub fn update_draw_indirect(&mut self, row_index: &CachedDrawIndirectArgs) {
-        self.draw_indirect_args_buffer
-            .update(row_index.get_row(), row_index.args.bitcast_to_row_entry());
+        let first = row_index.get_row();
+        for row in 0..=row_index.bands {
+            self.draw_indirect_args_buffer
+                .update(first.offset(row), row_index.args.bitcast_to_row_entry());
+        }
     }
 
     pub fn free_draw_indirect(&mut self, row_index: &CachedDrawIndirectArgs) {
-        self.draw_indirect_args_buffer.remove(row_index.get_row());
+        if row_index.bands == 0 {
+            self.draw_indirect_args_buffer.remove(row_index.get_row());
+        } else {
+            self.draw_indirect_args_buffer
+                .remove_range(row_index.get_row(), 1 + row_index.bands);
+        }
     }
 }
 
@@ -3529,6 +3543,7 @@ pub fn update_mesh_locations(
     mut q_cached_effects: Query<(
         Entity,
         &ExtractedEffectMesh,
+        Option<&ExtractedEffect>,
         Option<&mut CachedMeshLocation>,
         Option<&mut CachedDrawIndirectArgs>,
     )>,
@@ -3537,8 +3552,13 @@ pub fn update_mesh_locations(
     let _span = bevy::log::info_span!("update_mesh_locations").entered();
     trace!("update_mesh_locations");
 
-    for (entity, extracted_mesh, maybe_cached_mesh_location, maybe_cached_draw_indirect_args) in
-        &mut q_cached_effects
+    for (
+        entity,
+        extracted_mesh,
+        maybe_extracted_effect,
+        maybe_cached_mesh_location,
+        maybe_cached_draw_indirect_args,
+    ) in &mut q_cached_effects
     {
         let mut cmds = commands.entity(entity);
 
@@ -3617,11 +3637,16 @@ pub fn update_mesh_locations(
         // need to select the indexed vs. non-indexed buffer. Now that
         // we know whether the mesh is indexed, we can allocate it (or
         // reallocate it if indexing mode changed).
+        let bands = maybe_extracted_effect
+            .map_or(0, |effect| batch::depth_slice_bands(&effect.depth_slices));
         if let Some(mut cached_draw_indirect) = maybe_cached_draw_indirect_args {
             assert!(cached_draw_indirect.row.is_valid());
 
-            // If the GPU draw args changed, re-upload to GPU.
-            if new_draw_args != cached_draw_indirect.args {
+            if bands != cached_draw_indirect.bands {
+                effects_meta.free_draw_indirect(cached_draw_indirect.as_ref());
+                *cached_draw_indirect = effects_meta.allocate_draw_indirect(&new_draw_args, bands);
+            } else if new_draw_args != cached_draw_indirect.args {
+                // If the GPU draw args changed, re-upload to GPU.
                 debug!(
                     "Indirect draw args changed for asset {:?}\nold:{:?}\nnew:{:?}",
                     entity, cached_draw_indirect.args, new_draw_args
@@ -3630,7 +3655,7 @@ pub fn update_mesh_locations(
                 effects_meta.update_draw_indirect(cached_draw_indirect.as_ref());
             }
         } else {
-            cmds.insert(effects_meta.allocate_draw_indirect(&new_draw_args));
+            cmds.insert(effects_meta.allocate_draw_indirect(&new_draw_args, bands));
         }
 
         // Compare to any cached data and update if necessary, or insert if
@@ -6912,11 +6937,16 @@ pub(crate) fn prepare_bind_groups(
 
             // Bind group @0 of sort-copy pass
             let indirect_index_buffer = effect_buffer.indirect_index_buffer();
+            let Some(draw_indirect_buffer) = effects_meta.draw_indirect_args_buffer.buffer()
+            else {
+                continue;
+            };
             if let Err(err) = sort_bind_groups.ensure_sort_copy_bind_group(
                 &render_device,
                 indirect_index_buffer,
                 effect_metadata_buffer,
                 &spawner_buffer,
+                draw_indirect_buffer,
                 &pipeline_cache,
             ) {
                 error!(
@@ -7049,10 +7079,9 @@ fn draw<'w>(
     let spawner_size = effects_meta.spawner_buffer.aligned_size() as u32;
     assert!(spawner_size >= GpuSpawnerParams::min_size().get() as u32);
 
-    // A band's batch info follows its effect's, nearest first.
-    let band_offset = effect_draw_batch.depth_slice.map_or(0, |slice| {
-        (slice.band + 1) * batcher.batch_info_buffer_aligned_size()
-    });
+    // A band's batch info and draw args follow its effect's, nearest first.
+    let band_row = effect_draw_batch.depth_slice.map_or(0, |slice| slice.band + 1);
+    let band_offset = band_row * batcher.batch_info_buffer_aligned_size();
 
     match render_mesh.buffer_info {
         RenderMeshBufferInfo::Indexed { index_format, .. } => {
@@ -7086,7 +7115,7 @@ fn draw<'w>(
                     property_bind_group,
                     &[effect_data.render_batch_info_offset + band_offset],
                 );
-                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
+                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0 + band_row;
                 assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
                 let draw_indirect_offset =
                     draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
@@ -7129,7 +7158,7 @@ fn draw<'w>(
                     property_bind_group,
                     &[effect_data.render_batch_info_offset + band_offset],
                 );
-                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
+                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0 + band_row;
                 assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
                 let draw_indirect_offset =
                     draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
@@ -8113,10 +8142,18 @@ fn simulate(
                             compute_pass.insert_debug_marker("ERROR:MissingSortCopySpawnerBuffer");
                             continue;
                         };
+                        let Some(draw_indirect_buffer) =
+                            effects_meta.draw_indirect_args_buffer.buffer()
+                        else {
+                            warn!("Missing draw indirect buffer for sort-copy.");
+                            compute_pass.insert_debug_marker("ERROR:MissingSortCopyDrawBuffer");
+                            continue;
+                        };
                         let Some(bind_group) = sort_bind_groups.sort_copy_bind_group(
                             indirect_index_buffer.id(),
                             effect_metadata_buffer.id(),
                             spawner_buffer.id(),
+                            draw_indirect_buffer.id(),
                         ) else {
                             warn!("Missing sort-copy bind group.");
                             compute_pass.insert_debug_marker("ERROR:MissingSortCopyBindGroup");

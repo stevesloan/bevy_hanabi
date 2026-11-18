@@ -1,4 +1,4 @@
-import bevy_hanabi::render::vfx_common::{EffectMetadata, Spawner};
+import bevy_hanabi::render::vfx_common::{DrawIndexedIndirectArgs, EffectMetadata, Spawner};
 
 /// Key-value pair for sorting, with optional second sort key.
 struct KeyValuePair {
@@ -31,6 +31,7 @@ struct MergeParams {
 @group(0) @binding(2) var<storage, read_write> effect_metadatas : array<EffectMetadata>;
 @group(0) @binding(3) var<storage, read_write> spawner : Spawner;
 @group(0) @binding(4) var<storage, read> merge_params : MergeParams;
+@group(0) @binding(5) var<storage, read_write> draw_indirect_buffer : array<DrawIndexedIndirectArgs>;
 
 /// Copy the sorted particle indices back into the effect index buffer.
 @compute @workgroup_size(64)
@@ -55,10 +56,16 @@ fn sort_copy(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     // Depth slices: rows are sorted farthest first, so each edge splits them
     // once. The row just before that split records it; if every row is
     // nearer than an edge, the first row does.
+    //
+    // Each band, nearest first, draws from its own args after the effect's,
+    // zeroed by the indirect pass: band b's instances run from edge b's split
+    // (0 past the last edge) to edge b - 1's (the count before the first).
+    // Each split adds to one band's count and takes from the next.
     let edge_count = spawner.depth_slice_count;
     if (edge_count == 0u) {
         return;
     }
+    let band_args = spawner.draw_indirect_index + 1u;
     // The back-to-front sort key is the distance's bits, inverted.
     let distance = bitcast<f32>(~sort_buffer.pairs[source_offset + row_index].key);
     var next_distance = -1.0;
@@ -68,12 +75,16 @@ fn sort_copy(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     for (var edge = 0u; edge < edge_count; edge += 1u) {
         let at = spawner.depth_slice_edges[edge];
         if (distance >= at && next_distance < at) {
-            spawner.depth_slice_rows[edge] = row_index + 1u;
+            let split = row_index + 1u;
+            spawner.depth_slice_rows[edge] = split;
+            atomicSub(&draw_indirect_buffer[band_args + edge].instance_count, split);
+            atomicAdd(&draw_indirect_buffer[band_args + edge + 1u].instance_count, split);
         } else if (row_index == 0u && distance < at) {
             spawner.depth_slice_rows[edge] = 0u;
         }
     }
     if (row_index == 0u) {
         spawner.depth_slice_rows[edge_count] = count;
+        atomicAdd(&draw_indirect_buffer[band_args].instance_count, count);
     }
 }
