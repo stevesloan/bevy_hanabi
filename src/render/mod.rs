@@ -4803,6 +4803,10 @@ pub(crate) fn batch_effects(
                 None
             };
 
+        let transparent = !extracted_effect
+            .layout_flags
+            .intersects(LayoutFlags::USE_ALPHA_MASK | LayoutFlags::OPAQUE);
+
         // Append to sorted compute batches; this may merge with the previous
         // one.
         let (new_effect_batch_index, sort_prefix_sum_index) =
@@ -4813,15 +4817,20 @@ pub(crate) fn batch_effects(
                 new_effect_batch_index,
                 entity,
             );
+        }
 
-            // Spawn an EffectDrawBatch to drive rendering for that batch. Note
-            // that technically nothing imposes we use the same
-            // batching for compute init/update and for rendering,
-            // so we could (and probably should) re-batch specifically
-            // for rendering. For now we just use the same batches.
+        // Spawn an EffectDrawBatch to drive rendering. Rendering needn't use
+        // the compute batches: transparent instances are drawn one by one.
+        if let Some((effect_batch_index, instance)) = EffectDrawBatch::for_pushed(
+            transparent,
+            new_effect_batch_index,
+            batcher.len(),
+            batcher.last().map_or(0, |batch| batch.effect_data.len()),
+        ) {
             commands
                 .spawn(EffectDrawBatch {
-                    effect_batch_index: new_effect_batch_index,
+                    effect_batch_index,
+                    instance,
                     translation,
                     main_entity: *main_entity,
                 })
@@ -5483,8 +5492,8 @@ fn emit_sorted_draw<T, F>(
             // TODO - Profile to confirm.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .effect_data
+            let has_visible_entity = draw_batch
+                .effect_data(effect_batch)
                 .iter()
                 .any(|effect_data| view_entities.contains(effect_data.entity as usize));
             if !has_visible_entity {
@@ -5694,8 +5703,8 @@ fn emit_binned_draw<T, F, G>(
             // TODO - Profile to confirm.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .effect_data
+            let has_visible_entity = draw_batch
+                .effect_data(effect_batch)
                 .iter()
                 .any(|effect_data| view_entities.contains(effect_data.entity as usize));
             if !has_visible_entity {
@@ -6941,9 +6950,9 @@ fn draw<'w>(
             // );
             trace!(
                 "Emit non-batched draw_indexed_indirect() for {} effect instances...",
-                effect_batch.effect_data.len()
+                effect_draw_batch.effect_data(effect_batch).len()
             );
-            for effect_data in &effect_batch.effect_data {
+            for effect_data in effect_draw_batch.effect_data(effect_batch) {
                 pass.set_bind_group(
                     2,
                     property_bind_group,
@@ -6976,9 +6985,9 @@ fn draw<'w>(
             // );
             trace!(
                 "Emit non-batched draw_indirect() for {} effect instances...",
-                effect_batch.effect_data.len()
+                effect_draw_batch.effect_data(effect_batch).len()
             );
-            for effect_data in &effect_batch.effect_data {
+            for effect_data in effect_draw_batch.effect_data(effect_batch) {
                 pass.set_bind_group(
                     2,
                     property_bind_group,
