@@ -56,6 +56,7 @@ use bevy::{
         prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
     },
     render::{
+        diagnostic::RecordDiagnostics,
         mesh::allocator::MeshSlabs,
         render_phase::{BinnedPhaseItem, ViewBinnedRenderPhases},
     },
@@ -7261,6 +7262,11 @@ fn simulate(
     };
 
     // Compute init pass
+    // Each stage is timed on the GPU when Bevy's render diagnostics are on
+    // (`RenderDiagnosticsPlugin`), as `render/hanabi/<stage>/elapsed_gpu`.
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let init_span = diagnostics.time_span(render_context.command_encoder(), "hanabi/init");
     {
         trace!("init: loop over effect batches...");
 
@@ -7418,6 +7424,7 @@ fn simulate(
             trace!("init compute dispatched");
         }
     }
+    init_span.end(render_context.command_encoder());
 
     // Indirect dispatch compute pass
     {
@@ -7519,6 +7526,7 @@ fn simulate(
     //
     // Simulate all alive particles.
     let mut needs_sort = false;
+    let update_span = diagnostics.time_span(render_context.command_encoder(), "hanabi/update");
     {
         let mut compute_pass =
             HanabiComputePass::new("hanabi:update", &pipeline_cache, &mut render_context);
@@ -7614,365 +7622,377 @@ fn simulate(
             trace!("update compute dispatched");
         }
     }
+    update_span.end(render_context.command_encoder());
 
     // Do sorting for ribbons
+    let sort_span = diagnostics.time_span(render_context.command_encoder(), "hanabi/sort");
     if needs_sort {
-        // Copy alive counts for sort prefix sum compute pass
-        //
-        // After the update pass (atomically) updated the particle alive count
-        // per effect instance, copy that number into the prefix sum
-        // buffer, so that the prefix sum pass can calculate the prefix
-        // sum for sorting.
-        let Some(queue_index) = batcher.sort_fill_prefix_sum_queue_index else {
-            warn!("Missing alive count copy queue for ribbon sorting.");
-            return;
-        };
-        gpu_buffer_operations.dispatch(
-            queue_index,
-            &mut render_context,
-            &utils_pipeline,
-            Some("hanabi:sort_fill_prefix_sum"),
-        );
-
-        // Sort prefix sum compute pass
-        //
-        // Calculate the prefix sum of the number of alive particles to sort.
-        {
-            let mut compute_pass = HanabiComputePass::new(
-                "hanabi:sort_prefix_sum",
-                &pipeline_cache,
-                &mut render_context,
+        // A closure, so a sort that can't run still ends its span.
+        (|render_context: &mut RenderContext| {
+            // Copy alive counts for sort prefix sum compute pass
+            //
+            // After the update pass (atomically) updated the particle alive count
+            // per effect instance, copy that number into the prefix sum
+            // buffer, so that the prefix sum pass can calculate the prefix
+            // sum for sorting.
+            let Some(queue_index) = batcher.sort_fill_prefix_sum_queue_index else {
+                warn!("Missing alive count copy queue for ribbon sorting.");
+                return;
+            };
+            gpu_buffer_operations.dispatch(
+                queue_index,
+                render_context,
+                &utils_pipeline,
+                Some("hanabi:sort_fill_prefix_sum"),
             );
 
-            trace!("record commands for sort prefix sum pass...");
-
-            if compute_pass
-                .set_cached_compute_pipeline(effects_meta.prefix_sum_pipeline_id)
-                .is_err()
+            // Sort prefix sum compute pass
+            //
+            // Calculate the prefix sum of the number of alive particles to sort.
             {
-                // FIXME - Bevy doesn't allow returning custom errors here...
-                trace!("ERROR - Failed to set prefix sum compute pipeline. Simulation aborted.");
-                return;
+                let mut compute_pass = HanabiComputePass::new(
+                    "hanabi:sort_prefix_sum",
+                    &pipeline_cache,
+                    render_context,
+                );
+
+                trace!("record commands for sort prefix sum pass...");
+
+                if compute_pass
+                    .set_cached_compute_pipeline(effects_meta.prefix_sum_pipeline_id)
+                    .is_err()
+                {
+                    // FIXME - Bevy doesn't allow returning custom errors here...
+                    trace!(
+                        "ERROR - Failed to set prefix sum compute pipeline. Simulation aborted."
+                    );
+                    return;
+                }
+
+                // Dispatch one thread per init effect batch.
+                const WORKGROUP_SIZE: u32 = 64;
+                // Note: This only works because we use the same batches for the
+                // init and update passes. A priori there's no reason
+                // why we couldn't split them, since likely the batches
+                // would be different.
+                let total_batch_count = batcher.len() as u32;
+                let workgroup_count = total_batch_count.div_ceil(WORKGROUP_SIZE);
+
+                // Setup vfx_prefix_sum pass
+                compute_pass.set_bind_group(0, prefix_sum_bind_group, &[]);
+                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+                trace!(
+                    "prefix sum dispatched: total_batch_count={} workgroup_count={}",
+                    total_batch_count,
+                    workgroup_count
+                );
             }
 
-            // Dispatch one thread per init effect batch.
-            const WORKGROUP_SIZE: u32 = 64;
-            // Note: This only works because we use the same batches for the
-            // init and update passes. A priori there's no reason
-            // why we couldn't split them, since likely the batches
-            // would be different.
-            let total_batch_count = batcher.len() as u32;
-            let workgroup_count = total_batch_count.div_ceil(WORKGROUP_SIZE);
-
-            // Setup vfx_prefix_sum pass
-            compute_pass.set_bind_group(0, prefix_sum_bind_group, &[]);
-            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-            trace!(
-                "prefix sum dispatched: total_batch_count={} workgroup_count={}",
-                total_batch_count,
-                workgroup_count
+            // Compute sort fill dispatch pass - Fill the indirect dispatch structs
+            // for any batch of particles which needs sorting, based on the
+            // actual number of alive particles in the batch after their
+            // update in the compute update pass. Since particles may die
+            // during update, this may be different from the number of
+            // particles updated.
+            let Some(queue_index) = batcher.fill_dispatch_queue_index else {
+                warn!("Missing indirect dispatch queue for ribbon sorting (fill).");
+                return;
+            };
+            gpu_buffer_operations.dispatch(
+                queue_index,
+                render_context,
+                &utils_pipeline,
+                Some("hanabi:sort_fill_dispatch"),
             );
-        }
 
-        // Compute sort fill dispatch pass - Fill the indirect dispatch structs
-        // for any batch of particles which needs sorting, based on the
-        // actual number of alive particles in the batch after their
-        // update in the compute update pass. Since particles may die
-        // during update, this may be different from the number of
-        // particles updated.
-        let Some(queue_index) = batcher.fill_dispatch_queue_index else {
-            warn!("Missing indirect dispatch queue for ribbon sorting (fill).");
-            return;
-        };
-        gpu_buffer_operations.dispatch(
-            queue_index,
-            &mut render_context,
-            &utils_pipeline,
-            Some("hanabi:sort_fill_dispatch"),
-        );
+            // Compute sort sort dispatch pass - Fill the indirect dispatch structs
+            // for any batch of particles which needs sorting, based on the
+            // actual number of alive particles in the batch after their
+            // update in the compute update pass. Since particles may die
+            // during update, this may be different from the number of
+            // particles updated.
+            let Some(queue_index) = batcher.sort_dispatch_queue_index else {
+                warn!("Missing indirect dispatch queue for ribbon sorting (sort).");
+                return;
+            };
+            gpu_buffer_operations.dispatch(
+                queue_index,
+                render_context,
+                &utils_pipeline,
+                Some("hanabi:sort_sort_dispatch"),
+            );
 
-        // Compute sort sort dispatch pass - Fill the indirect dispatch structs
-        // for any batch of particles which needs sorting, based on the
-        // actual number of alive particles in the batch after their
-        // update in the compute update pass. Since particles may die
-        // during update, this may be different from the number of
-        // particles updated.
-        let Some(queue_index) = batcher.sort_dispatch_queue_index else {
-            warn!("Missing indirect dispatch queue for ribbon sorting (sort).");
-            return;
-        };
-        gpu_buffer_operations.dispatch(
-            queue_index,
-            &mut render_context,
-            &utils_pipeline,
-            Some("hanabi:sort_sort_dispatch"),
-        );
+            // Compute sort pass
+            {
+                let effect_metadata_buffer = effects_meta.effect_metadata_buffer.buffer().unwrap();
+                let indirect_args_buffer = sort_bind_groups.indirect_args_buffer().unwrap();
 
-        // Compute sort pass
-        {
-            let effect_metadata_buffer = effects_meta.effect_metadata_buffer.buffer().unwrap();
-            let indirect_args_buffer = sort_bind_groups.indirect_args_buffer().unwrap();
+                // Loop on batches and find those which need sorting
+                for effect_batch in batcher.iter() {
+                    if !effect_batch.layout_flags.contains(LayoutFlags::RIBBONS) {
+                        continue;
+                    }
+                    trace!("Processing RIBBONS effect batch for sorting...");
+                    assert!(effect_batch.particle_layout.contains(Attribute::RIBBON_ID));
+                    assert!(effect_batch.particle_layout.contains(Attribute::AGE)); // or is that optional?
 
-            // Loop on batches and find those which need sorting
-            for effect_batch in batcher.iter() {
-                if !effect_batch.layout_flags.contains(LayoutFlags::RIBBONS) {
-                    continue;
-                }
-                trace!("Processing RIBBONS effect batch for sorting...");
-                assert!(effect_batch.particle_layout.contains(Attribute::RIBBON_ID));
-                assert!(effect_batch.particle_layout.contains(Attribute::AGE)); // or is that optional?
-
-                let Some(effect_buffer) = effect_cache.get_slab(&effect_batch.slab_id) else {
-                    warn!("Missing sort-fill effect buffer.");
-                    continue;
-                };
-
-                // Loop on individual effects instances in the batch. Currently
-                // we can't sort an entire batch at once, only a
-                // single instance. This is in part because each
-                // instance already requires 2 keys to sort (RIBBON_ID + AGE),
-                // and it's not clear that adding a third key is
-                // faster than doing multiple dispatches.
-                for (effect_index, effect_data) in effect_batch.effect_data.iter().enumerate() {
-                    let Some(fill_indirect_dispatch_index) =
-                        effect_data.sort_fill_indirect_dispatch_index
-                    else {
+                    let Some(effect_buffer) = effect_cache.get_slab(&effect_batch.slab_id) else {
+                        warn!("Missing sort-fill effect buffer.");
                         continue;
                     };
-                    let Some(sort_indirect_dispatch_index) =
-                        effect_data.sort_indirect_dispatch_index
-                    else {
-                        continue;
-                    };
-                    let fill_indirect_offset = sort_bind_groups
-                        .get_indirect_args_byte_offset(fill_indirect_dispatch_index);
-                    let sort_indirect_offset = sort_bind_groups
-                        .get_indirect_args_byte_offset(sort_indirect_dispatch_index);
 
-                    // Fill the sort buffer with the key-value pairs to sort
-                    {
-                        let mut compute_pass = HanabiComputePass::new(
-                            "hanabi:sort_fill",
-                            &pipeline_cache,
-                            &mut render_context,
-                        );
-                        compute_pass.push_debug_group("hanabi:sort_fill");
-
-                        let Some(pipeline_id) = sort_bind_groups
-                            .get_sort_fill_pipeline_id(&effect_batch.particle_layout)
+                    // Loop on individual effects instances in the batch. Currently
+                    // we can't sort an entire batch at once, only a
+                    // single instance. This is in part because each
+                    // instance already requires 2 keys to sort (RIBBON_ID + AGE),
+                    // and it's not clear that adding a third key is
+                    // faster than doing multiple dispatches.
+                    for (effect_index, effect_data) in effect_batch.effect_data.iter().enumerate() {
+                        let Some(fill_indirect_dispatch_index) =
+                            effect_data.sort_fill_indirect_dispatch_index
                         else {
-                            warn!("Missing sort-fill pipeline.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortFillPipeline");
                             continue;
                         };
-                        if compute_pass
-                            .set_cached_compute_pipeline(pipeline_id)
-                            .is_err()
+                        let Some(sort_indirect_dispatch_index) =
+                            effect_data.sort_indirect_dispatch_index
+                        else {
+                            continue;
+                        };
+                        let fill_indirect_offset = sort_bind_groups
+                            .get_indirect_args_byte_offset(fill_indirect_dispatch_index);
+                        let sort_indirect_offset = sort_bind_groups
+                            .get_indirect_args_byte_offset(sort_indirect_dispatch_index);
+
+                        // Fill the sort buffer with the key-value pairs to sort
                         {
-                            compute_pass.insert_debug_marker("ERROR:FailedToSetSortFillPipeline");
-                            compute_pass.pop_debug_group();
-                            return;
-                        }
-
-                        let spawner_aligned_size = effects_meta.spawner_buffer.aligned_size();
-                        assert!(
-                            spawner_aligned_size >= GpuSpawnerParams::min_size().get() as usize
-                        );
-                        let spawner_offset = (effect_batch.spawner_base + effect_index as u32)
-                            * spawner_aligned_size as u32;
-
-                        let particle_buffer = effect_buffer.particle_buffer();
-                        let indirect_index_buffer = effect_buffer.indirect_index_buffer();
-                        let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
-                            warn!("Missing spawner buffer for sort-fill.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortFillSpawnerBuffer");
-                            continue;
-                        };
-                        let Some(bind_group) = sort_bind_groups.sort_fill_bind_group(
-                            particle_buffer.id(),
-                            indirect_index_buffer.id(),
-                            effect_metadata_buffer.id(),
-                            spawner_buffer.id(),
-                        ) else {
-                            warn!("Missing sort-fill bind group.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortFillBindGroup");
-                            continue;
-                        };
-                        compute_pass.set_bind_group(0, bind_group, &[spawner_offset]);
-
-                        compute_pass.dispatch_workgroups_indirect(
-                            indirect_args_buffer,
-                            fill_indirect_offset,
-                        );
-                        compute_pass.pop_debug_group();
-                    }
-
-                    // Block-sort particles
-                    {
-                        let mut compute_pass = HanabiComputePass::new(
-                            "hanabi:sort",
-                            &pipeline_cache,
-                            &mut render_context,
-                        );
-                        compute_pass.push_debug_group("hanabi:sort");
-
-                        if compute_pass
-                            .set_cached_compute_pipeline(sort_bind_groups.sort_pipeline_id())
-                            .is_err()
-                        {
-                            compute_pass.insert_debug_marker("ERROR:FailedToSetSortPipeline");
-                            compute_pass.pop_debug_group();
-                            return;
-                        }
-
-                        let Some(bind_group) = sort_bind_groups.sort_bind_group() else {
-                            warn!("Missing sort bind group.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortBindGroup");
-                            continue;
-                        };
-                        compute_pass.set_bind_group(0, bind_group, &[]);
-                        compute_pass.dispatch_workgroups_indirect(
-                            indirect_args_buffer,
-                            sort_indirect_offset,
-                        );
-
-                        compute_pass.pop_debug_group();
-                    }
-
-                    // If the number of particles is larger than the block size
-                    // (1024), we need to dispatch mergesort
-                    // passes to merge pairs of lists until the full list is
-                    // sorted. Since we don't know (from CPU) the number of
-                    // particles, and so the
-                    // number of required passes, we over-estimate from the
-                    // total effect capacity.
-                    let block_size = 1024; // see shader
-                    let num_blocks = effect_batch.capacity.div_ceil(block_size);
-                    let num_passes = if num_blocks > 1 {
-                        32 - (num_blocks - 1).leading_zeros() // log2(n-1) rounded up
-                    } else {
-                        0
-                    };
-                    if num_passes > 0 {
-                        let pipeline_id = sort_bind_groups.sort_merge_pipeline_id();
-                        let Some(bind_group) = sort_bind_groups.sort_merge_bind_group() else {
-                            warn!("Missing sort bind group.");
-                            return;
-                        };
-
-                        let mut num_lists = num_blocks;
-                        for ipass in 0..num_passes {
-                            // A separate compute pass provides the
-                            // storage-buffer visibility
-                            // guarantee required before the next ping-pong
-                            // merge stage reads
-                            // this stage's output.
                             let mut compute_pass = HanabiComputePass::new(
-                                "hanabi:sort_merge",
+                                "hanabi:sort_fill",
                                 &pipeline_cache,
-                                &mut render_context,
+                                render_context,
                             );
-                            compute_pass.push_debug_group("hanabi:sort_merge");
+                            compute_pass.push_debug_group("hanabi:sort_fill");
+
+                            let Some(pipeline_id) = sort_bind_groups
+                                .get_sort_fill_pipeline_id(&effect_batch.particle_layout)
+                            else {
+                                warn!("Missing sort-fill pipeline.");
+                                compute_pass.insert_debug_marker("ERROR:MissingSortFillPipeline");
+                                continue;
+                            };
                             if compute_pass
                                 .set_cached_compute_pipeline(pipeline_id)
                                 .is_err()
                             {
                                 compute_pass
-                                    .insert_debug_marker("ERROR:FailedToSetSortMergePipeline");
+                                    .insert_debug_marker("ERROR:FailedToSetSortFillPipeline");
                                 compute_pass.pop_debug_group();
                                 return;
                             }
 
-                            let offset = sort_bind_groups.merge_params_buffer().dynamic_offset(
-                                SortBindGroups::COPY_SOURCE_PARAM_COUNT + ipass as usize,
+                            let spawner_aligned_size = effects_meta.spawner_buffer.aligned_size();
+                            assert!(
+                                spawner_aligned_size >= GpuSpawnerParams::min_size().get() as usize
                             );
-                            compute_pass.set_bind_group(0, bind_group, &[offset]);
+                            let spawner_offset = (effect_batch.spawner_base + effect_index as u32)
+                                * spawner_aligned_size as u32;
 
-                            // For now, each thread serially merges a pair of
-                            // lists. A final
-                            // unpaired list is copied to the other ping-pong
-                            // half.
-                            let num_threads = num_lists.div_ceil(2);
-                            let num_workgroups = num_threads.div_ceil(64);
-                            compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
+                            let particle_buffer = effect_buffer.particle_buffer();
+                            let indirect_index_buffer = effect_buffer.indirect_index_buffer();
+                            let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
+                                warn!("Missing spawner buffer for sort-fill.");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:MissingSortFillSpawnerBuffer");
+                                continue;
+                            };
+                            let Some(bind_group) = sort_bind_groups.sort_fill_bind_group(
+                                particle_buffer.id(),
+                                indirect_index_buffer.id(),
+                                effect_metadata_buffer.id(),
+                                spawner_buffer.id(),
+                            ) else {
+                                warn!("Missing sort-fill bind group.");
+                                compute_pass.insert_debug_marker("ERROR:MissingSortFillBindGroup");
+                                continue;
+                            };
+                            compute_pass.set_bind_group(0, bind_group, &[spawner_offset]);
 
+                            compute_pass.dispatch_workgroups_indirect(
+                                indirect_args_buffer,
+                                fill_indirect_offset,
+                            );
                             compute_pass.pop_debug_group();
-                            num_lists = num_lists.div_ceil(2);
                         }
-                    }
 
-                    // Copy the sorted indices back into the indirect index
-                    // buffer.
-                    {
-                        let mut compute_pass = HanabiComputePass::new(
-                            "hanabi:sort_copy",
-                            &pipeline_cache,
-                            &mut render_context,
-                        );
-                        compute_pass.push_debug_group("hanabi:copy_sorted_indices");
-
-                        let pipeline_id = sort_bind_groups.sort_copy_pipeline_id();
-                        if compute_pass
-                            .set_cached_compute_pipeline(pipeline_id)
-                            .is_err()
+                        // Block-sort particles
                         {
-                            compute_pass.insert_debug_marker("ERROR:FailedToSetSortCopyPipeline");
+                            let mut compute_pass = HanabiComputePass::new(
+                                "hanabi:sort",
+                                &pipeline_cache,
+                                render_context,
+                            );
+                            compute_pass.push_debug_group("hanabi:sort");
+
+                            if compute_pass
+                                .set_cached_compute_pipeline(sort_bind_groups.sort_pipeline_id())
+                                .is_err()
+                            {
+                                compute_pass.insert_debug_marker("ERROR:FailedToSetSortPipeline");
+                                compute_pass.pop_debug_group();
+                                return;
+                            }
+
+                            let Some(bind_group) = sort_bind_groups.sort_bind_group() else {
+                                warn!("Missing sort bind group.");
+                                compute_pass.insert_debug_marker("ERROR:MissingSortBindGroup");
+                                continue;
+                            };
+                            compute_pass.set_bind_group(0, bind_group, &[]);
+                            compute_pass.dispatch_workgroups_indirect(
+                                indirect_args_buffer,
+                                sort_indirect_offset,
+                            );
+
                             compute_pass.pop_debug_group();
-                            return;
                         }
 
-                        let spawner_aligned_size = effects_meta.spawner_buffer.aligned_size();
-                        assert!(
-                            spawner_aligned_size >= GpuSpawnerParams::min_size().get() as usize
-                        );
-                        let spawner_offset = (effect_batch.spawner_base + effect_index as u32)
-                            * spawner_aligned_size as u32;
+                        // If the number of particles is larger than the block size
+                        // (1024), we need to dispatch mergesort
+                        // passes to merge pairs of lists until the full list is
+                        // sorted. Since we don't know (from CPU) the number of
+                        // particles, and so the
+                        // number of required passes, we over-estimate from the
+                        // total effect capacity.
+                        let block_size = 1024; // see shader
+                        let num_blocks = effect_batch.capacity.div_ceil(block_size);
+                        let num_passes = if num_blocks > 1 {
+                            32 - (num_blocks - 1).leading_zeros() // log2(n-1) rounded up
+                        } else {
+                            0
+                        };
+                        if num_passes > 0 {
+                            let pipeline_id = sort_bind_groups.sort_merge_pipeline_id();
+                            let Some(bind_group) = sort_bind_groups.sort_merge_bind_group() else {
+                                warn!("Missing sort bind group.");
+                                return;
+                            };
 
-                        let indirect_index_buffer = effect_buffer.indirect_index_buffer();
-                        let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
-                            warn!("Missing spawner buffer for sort-copy.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortCopySpawnerBuffer");
-                            continue;
-                        };
-                        let Some(bind_group) = sort_bind_groups.sort_copy_bind_group(
-                            indirect_index_buffer.id(),
-                            effect_metadata_buffer.id(),
-                            spawner_buffer.id(),
-                        ) else {
-                            warn!("Missing sort-copy bind group.");
-                            compute_pass.insert_debug_marker("ERROR:MissingSortCopyBindGroup");
-                            continue;
-                        };
-                        let copy_source_offset = sort_bind_groups
-                            .merge_params_buffer()
-                            .dynamic_offset(num_passes as usize % 2);
-                        compute_pass.set_bind_group(
+                            let mut num_lists = num_blocks;
+                            for ipass in 0..num_passes {
+                                // A separate compute pass provides the
+                                // storage-buffer visibility
+                                // guarantee required before the next ping-pong
+                                // merge stage reads
+                                // this stage's output.
+                                let mut compute_pass = HanabiComputePass::new(
+                                    "hanabi:sort_merge",
+                                    &pipeline_cache,
+                                    render_context,
+                                );
+                                compute_pass.push_debug_group("hanabi:sort_merge");
+                                if compute_pass
+                                    .set_cached_compute_pipeline(pipeline_id)
+                                    .is_err()
+                                {
+                                    compute_pass
+                                        .insert_debug_marker("ERROR:FailedToSetSortMergePipeline");
+                                    compute_pass.pop_debug_group();
+                                    return;
+                                }
+
+                                let offset = sort_bind_groups.merge_params_buffer().dynamic_offset(
+                                    SortBindGroups::COPY_SOURCE_PARAM_COUNT + ipass as usize,
+                                );
+                                compute_pass.set_bind_group(0, bind_group, &[offset]);
+
+                                // For now, each thread serially merges a pair of
+                                // lists. A final
+                                // unpaired list is copied to the other ping-pong
+                                // half.
+                                let num_threads = num_lists.div_ceil(2);
+                                let num_workgroups = num_threads.div_ceil(64);
+                                compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
+
+                                compute_pass.pop_debug_group();
+                                num_lists = num_lists.div_ceil(2);
+                            }
+                        }
+
+                        // Copy the sorted indices back into the indirect index
+                        // buffer.
+                        {
+                            let mut compute_pass = HanabiComputePass::new(
+                                "hanabi:sort_copy",
+                                &pipeline_cache,
+                                render_context,
+                            );
+                            compute_pass.push_debug_group("hanabi:copy_sorted_indices");
+
+                            let pipeline_id = sort_bind_groups.sort_copy_pipeline_id();
+                            if compute_pass
+                                .set_cached_compute_pipeline(pipeline_id)
+                                .is_err()
+                            {
+                                compute_pass
+                                    .insert_debug_marker("ERROR:FailedToSetSortCopyPipeline");
+                                compute_pass.pop_debug_group();
+                                return;
+                            }
+
+                            let spawner_aligned_size = effects_meta.spawner_buffer.aligned_size();
+                            assert!(
+                                spawner_aligned_size >= GpuSpawnerParams::min_size().get() as usize
+                            );
+                            let spawner_offset = (effect_batch.spawner_base + effect_index as u32)
+                                * spawner_aligned_size as u32;
+
+                            let indirect_index_buffer = effect_buffer.indirect_index_buffer();
+                            let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
+                                warn!("Missing spawner buffer for sort-copy.");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:MissingSortCopySpawnerBuffer");
+                                continue;
+                            };
+                            let Some(bind_group) = sort_bind_groups.sort_copy_bind_group(
+                                indirect_index_buffer.id(),
+                                effect_metadata_buffer.id(),
+                                spawner_buffer.id(),
+                            ) else {
+                                warn!("Missing sort-copy bind group.");
+                                compute_pass.insert_debug_marker("ERROR:MissingSortCopyBindGroup");
+                                continue;
+                            };
+                            let copy_source_offset = sort_bind_groups
+                                .merge_params_buffer()
+                                .dynamic_offset(num_passes as usize % 2);
+                            compute_pass.set_bind_group(
+                                0,
+                                bind_group,
+                                &[spawner_offset, copy_source_offset],
+                            );
+
+                            compute_pass.dispatch_workgroups_indirect(
+                                indirect_args_buffer,
+                                fill_indirect_offset,
+                            );
+
+                            compute_pass.pop_debug_group();
+                        }
+
+                        // The sort-fill pass uses this counter as an atomic append
+                        // index. It must remain valid through
+                        // the block-sort, merge, and copy passes, then be
+                        // cleared before sorting the next effect instance.
+                        render_context.command_encoder().clear_buffer(
+                            sort_bind_groups.sort_buffer(),
                             0,
-                            bind_group,
-                            &[spawner_offset, copy_source_offset],
+                            Some(4),
                         );
-
-                        compute_pass.dispatch_workgroups_indirect(
-                            indirect_args_buffer,
-                            fill_indirect_offset,
-                        );
-
-                        compute_pass.pop_debug_group();
                     }
-
-                    // The sort-fill pass uses this counter as an atomic append
-                    // index. It must remain valid through
-                    // the block-sort, merge, and copy passes, then be
-                    // cleared before sorting the next effect instance.
-                    render_context.command_encoder().clear_buffer(
-                        sort_bind_groups.sort_buffer(),
-                        0,
-                        Some(4),
-                    );
                 }
             }
-        }
+        })(&mut render_context);
     }
+    sort_span.end(render_context.command_encoder());
 }
 
 impl From<LayoutFlags> for ParticleRenderAlphaMaskPipelineKey {
