@@ -141,6 +141,7 @@ fn setup(
             EffectMaterial {
                 // Assign our LUT image to texture slot #0
                 images: vec![image],
+                ..default()
             },
         ))
         .with_children(|p| {

@@ -503,6 +503,34 @@ impl Module {
         }
     }
 
+    /// Add a read-only storage buffer slot to the module, whose elements have
+    /// the WGSL type `element`; returns its index.
+    ///
+    /// The shaders declare the slot as `material_buffer_N`
+    /// ([`BufferSlot::wgsl_name()`]), and the buffer bound to it is given by
+    /// [`EffectMaterial::buffers`] at the same index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a buffer slot with the same name already exists inside this
+    /// module.
+    ///
+    /// [`BufferSlot::wgsl_name()`]: crate::BufferSlot::wgsl_name
+    /// [`EffectMaterial::buffers`]: crate::EffectMaterial::buffers
+    pub fn add_buffer_slot(
+        &mut self,
+        name: impl Into<String>,
+        element: impl Into<String>,
+    ) -> usize {
+        let name = name.into();
+        assert!(!self.texture_layout.buffers.iter().any(|b| b.name == name));
+        self.texture_layout.buffers.push(crate::BufferSlot {
+            name,
+            element: element.into(),
+        });
+        self.texture_layout.buffers.len() - 1
+    }
+
     /// Insert into the given set all attributes referenced by any
     /// [`AttributeExpr`] present in the module.
     ///

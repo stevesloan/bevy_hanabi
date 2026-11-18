@@ -169,6 +169,7 @@ fn setup(
         ParticleEffect::new(effect),
         EffectMaterial {
             images: vec![texture_handle],
+            ..default()
         },
         Name::new("effect"),
     ));

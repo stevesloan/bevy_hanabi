@@ -105,6 +105,7 @@ fn setup(
             // We need to bind a texture to the slot #0 we created above
             EffectMaterial {
                 images: vec![texture_handle.clone()],
+                ..default()
             },
         ))
         .with_children(|p| {

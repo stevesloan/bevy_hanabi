@@ -105,6 +105,7 @@ impl InstanceManager {
                     // example only.
                     EffectMaterial {
                         images: vec![self.texture.clone()],
+                        ..default()
                     },
                     // Only used if alt_effect, but just simpler to add all the time for this
                     // example only.

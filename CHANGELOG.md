@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `SortMode::BackToFront` can be drawn in 3D as one transparent item per band of distance
   from the camera, each ordered at its band's middle, so other transparent objects inside a
   widespread effect are ordered against the nearby particles rather than the whole effect.
+- Added buffer slots: `Module::add_buffer_slot()` declares a read-only storage buffer
+  (`BufferSlot`, in `TextureLayout::buffers`), bound after the material's textures and read by
+  custom modifier code in the init, update and render shaders as `material_buffer_N`. The
+  `ShaderBuffer` for each slot is given by `EffectMaterial::buffers`; rewriting it each frame
+  hands an effect per-frame data of any length, such as a list of emitters for its init.
 
 ### Fixed
 

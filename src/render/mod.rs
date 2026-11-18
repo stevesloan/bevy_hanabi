@@ -38,6 +38,7 @@ use bevy::{
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue},
+        storage::{GpuShaderBuffer, ShaderBuffer},
         sync_world::{MainEntity, RenderEntity, TemporaryRenderEntity},
         texture::GpuImage,
         view::{
@@ -2379,6 +2380,8 @@ pub(crate) struct ExtractedEffect {
     pub texture_layout: TextureLayout,
     /// Textures.
     pub textures: Vec<Handle<Image>>,
+    /// Storage buffers, one per [`TextureLayout::buffers`] slot.
+    pub buffers: Vec<Handle<ShaderBuffer>>,
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
     /// Effect shaders.
@@ -2773,6 +2776,18 @@ pub(crate) fn extract_effects(
         } else {
             compiled_effect.textures.clone()
         };
+        let num_expected_buffers = texture_layout.buffers.len();
+        if compiled_effect.buffers.len() < num_expected_buffers {
+            error!(
+                "Instance of effect '{}' on entity {:?} is missing some buffers. Layout expected {} buffers, but CompiledParticleEffect got {} instead.",
+                asset.name,
+                main_entity,
+                num_expected_buffers,
+                compiled_effect.buffers.len()
+            );
+            continue;
+        }
+        let buffers = compiled_effect.buffers[..num_expected_buffers].to_vec();
 
         // Extract general effect data
         let layout_flags = compiled_effect.layout_flags;
@@ -2793,6 +2808,7 @@ pub(crate) fn extract_effects(
             layout_flags,
             texture_layout,
             textures,
+            buffers,
             alpha_mode,
             effect_shaders: effect_shaders.clone(),
             simulation_condition: asset.simulation_condition,
@@ -4864,10 +4880,11 @@ pub(crate) fn batch_effects(
 
         let texture_layout = extracted_effect.texture_layout.clone();
         let textures = extracted_effect.textures.iter().map(Handle::id).collect();
+        let buffers = extracted_effect.buffers.iter().map(Handle::id).collect();
         let property_key = if let Some(cp) = cached_properties.as_ref() {
-            PropertyBindGroupKey::new(cp, texture_layout, textures)
+            PropertyBindGroupKey::new(cp, texture_layout, textures, buffers)
         } else {
-            PropertyBindGroupKey::texture_only(texture_layout, textures)
+            PropertyBindGroupKey::texture_only(texture_layout, textures, buffers)
         };
 
         // Create a single-effect batch candidate. It can be merged with the
@@ -5087,11 +5104,12 @@ pub(crate) struct BufferBindGroups {
     // init_fill_dispatch: Option<BindGroup>,
 }
 
-/// Combination of a texture layout and the bound textures.
+/// Combination of a texture layout and the bound textures and buffers.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 struct Material {
     layout: TextureLayout,
     textures: Vec<AssetId<Image>>,
+    buffers: Vec<AssetId<ShaderBuffer>>,
 }
 
 #[derive(Debug, Error)]
@@ -5104,6 +5122,10 @@ pub(super) enum MaterialBindingError {
     MultisampledImage,
     #[error("Incompatible image bound at texture slot '{0}'.")]
     IncompatibleImage(String),
+    #[error("Expected {0} buffers from layout, but got {1} instead.")]
+    InvalidBufferCount(u32, u32),
+    #[error("Missing GPU buffer for asset {0:?}, or it's empty.")]
+    MissingBuffer(AssetId<ShaderBuffer>),
 }
 
 impl Material {
@@ -5112,6 +5134,7 @@ impl Material {
         &'b self,
         binding_start: u32,
         gpu_images: &'a RenderAssets<GpuImage>,
+        gpu_buffers: Option<&'a RenderAssets<GpuShaderBuffer>>,
         entries: &'b mut Vec<BindGroupEntry<'a>>,
     ) -> Result<(), MaterialBindingError> {
         if self.layout.layout.len() != self.textures.len() {
@@ -5120,9 +5143,11 @@ impl Material {
                 self.textures.len() as u32,
             ));
         }
-
-        if self.textures.is_empty() {
-            return Ok(());
+        if self.layout.buffers.len() != self.buffers.len() {
+            return Err(MaterialBindingError::InvalidBufferCount(
+                self.layout.buffers.len() as u32,
+                self.buffers.len() as u32,
+            ));
         }
 
         let mut index = binding_start;
@@ -5153,7 +5178,39 @@ impl Material {
             });
             index += 2;
         }
+        for asset_id in &self.buffers {
+            let buffer = Self::gpu_buffer(gpu_buffers, *asset_id)?;
+            entries.push(BindGroupEntry {
+                binding: index,
+                resource: buffer.as_entire_binding(),
+            });
+            index += 1;
+        }
         Ok(())
+    }
+
+    /// The GPU buffers `buffers` are on now. A [`ShaderBuffer`] that grows
+    /// gets a new one under the same asset, which a bind group built with
+    /// the old one doesn't see.
+    pub fn gpu_buffer_ids(
+        buffers: &[AssetId<ShaderBuffer>],
+        gpu_buffers: Option<&RenderAssets<GpuShaderBuffer>>,
+    ) -> Result<Vec<BufferId>, MaterialBindingError> {
+        buffers
+            .iter()
+            .map(|id| Self::gpu_buffer(gpu_buffers, *id).map(Buffer::id))
+            .collect()
+    }
+
+    fn gpu_buffer(
+        gpu_buffers: Option<&RenderAssets<GpuShaderBuffer>>,
+        asset_id: AssetId<ShaderBuffer>,
+    ) -> Result<&Buffer, MaterialBindingError> {
+        gpu_buffers
+            .and_then(|buffers| buffers.get(asset_id))
+            .map(|gpu| &gpu.buffer)
+            .filter(|buffer| buffer.size() > 0)
+            .ok_or(MaterialBindingError::MissingBuffer(asset_id))
     }
 }
 
@@ -6601,6 +6658,7 @@ pub(crate) fn prepare_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     pipelines: PipelineParams,
     gpu_images: Res<RenderAssets<GpuImage>>,
+    gpu_buffers: Option<Res<RenderAssets<GpuShaderBuffer>>>,
     mut gpu_buffer_operation_queue: ResMut<GpuBufferOperations>,
 ) {
     // We can't simulate nor render anything without at least the spawner buffer
@@ -6806,6 +6864,7 @@ pub(crate) fn prepare_bind_groups(
             &render_device,
             &pipeline_cache,
             &gpu_images,
+            gpu_buffers.as_deref(),
         ) {
             match err {
                 property::PropertyBindGroupError::Material(MaterialBindingError::MissingImage(
@@ -6814,6 +6873,13 @@ pub(crate) fn prepare_bind_groups(
                     "Skipping effect batch {:?}: image {:?} is not available on the GPU yet.",
                     effect_batch.handle,
                     image,
+                ),
+                property::PropertyBindGroupError::Material(
+                    MaterialBindingError::MissingBuffer(buffer),
+                ) => trace!(
+                    "Skipping effect batch {:?}: buffer {:?} is not available on the GPU yet.",
+                    effect_batch.handle,
+                    buffer,
                 ),
                 property::PropertyBindGroupError::MissingPropertyBuffer(buffer_index) => {
                     error!("Missing property buffer #{buffer_index}, referenced by effect batch.")
@@ -8247,17 +8313,50 @@ mod tests {
                     name: "texture".to_string(),
                     dimension: SlotDimension::D2,
                 }],
+                ..default()
             },
             textures: vec![image],
+            buffers: vec![],
         };
         let gpu_images = RenderAssets::<GpuImage>::default();
         let mut entries = Vec::new();
 
         assert!(matches!(
-            material.append_binding_entries(4, &gpu_images, &mut entries),
+            material.append_binding_entries(4, &gpu_images, None, &mut entries),
             Err(MaterialBindingError::MissingImage(missing)) if missing == image
         ));
         assert!(entries.is_empty());
+    }
+
+    /// An effect whose buffer isn't on the GPU yet is skipped, not bound to
+    /// nothing.
+    #[test]
+    fn missing_material_buffer_is_an_error() {
+        let buffer = Handle::<ShaderBuffer>::default().id();
+        let material = Material {
+            layout: TextureLayout {
+                buffers: vec![crate::BufferSlot {
+                    name: "list".to_string(),
+                    element: "vec4<f32>".to_string(),
+                }],
+                ..default()
+            },
+            textures: vec![],
+            buffers: vec![buffer],
+        };
+        let gpu_images = RenderAssets::<GpuImage>::default();
+        let gpu_buffers = RenderAssets::<GpuShaderBuffer>::default();
+        let mut entries = Vec::new();
+
+        assert!(matches!(
+            material.append_binding_entries(4, &gpu_images, Some(&gpu_buffers), &mut entries),
+            Err(MaterialBindingError::MissingBuffer(missing)) if missing == buffer
+        ));
+        assert!(matches!(
+            Material::gpu_buffer_ids(&material.buffers, None),
+            Err(MaterialBindingError::MissingBuffer(_))
+        ));
+        assert!(Material::gpu_buffer_ids(&[], None).unwrap().is_empty());
     }
 
     #[cfg(feature = "gpu_tests")]
