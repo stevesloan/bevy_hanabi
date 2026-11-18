@@ -3,6 +3,15 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Fixed effects sharing a texture layout drawing with each other's textures: the cached bind
+  group binding an effect's material was keyed by its texture layout but not its textures, so
+  the first effect created with a layout lent its textures to every later effect with the same
+  layout and property block, until a buffer reallocation cleared the cache.
+
 ## [0.20.0] 2026-11-01
 
 _This version is compatible with Bevy 0.20_
