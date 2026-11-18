@@ -3,6 +3,16 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The particle sort's merge passes are parallel: one thread per particle, each placed
+  by binary search, rather than one thread walking each pair of lists. Sorting ~100k
+  particles drops from tens of milliseconds of GPU time to under one.
+- The sort buffer grows to the largest sorted effect's capacity, where it was fixed at
+  room for 131,072 particles and a larger sorted effect drew in no order.
+
 ## [0.20.0] 2026-11-01
 
 _This version is compatible with Bevy 0.20_

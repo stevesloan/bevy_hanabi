@@ -4793,6 +4793,7 @@ pub(crate) fn batch_effects(
                     Some(sort_indirect_dispatch_index);
 
                 // Ensure sort merge passes are allocated, if needed
+                sort_bind_groups.ensure_sort_capacity(&render_device, extracted_effect.capacity);
                 sort_bind_groups.ensure_mergesort_passes(extracted_effect.capacity);
 
                 Some((
@@ -7177,6 +7178,18 @@ impl<'a> HanabiComputePass<'a> {
     }
 }
 
+/// Workgroups of a merge pass over `capacity` items, `[x, y]`: one thread
+/// per item, in rows no wider than a dispatch dimension may be.
+fn merge_workgroups(capacity: u32) -> [u32; 2] {
+    // `MAX_WORKGROUPS_PER_ROW` in `vfx_sort_merge.wesl`.
+    const MAX_WORKGROUPS_PER_ROW: u32 = 65535;
+    let workgroups = capacity.div_ceil(64);
+    [
+        workgroups.min(MAX_WORKGROUPS_PER_ROW),
+        workgroups.div_ceil(MAX_WORKGROUPS_PER_ROW).max(1),
+    ]
+}
+
 fn simulate(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
@@ -7860,7 +7873,6 @@ fn simulate(
                             return;
                         };
 
-                        let mut num_lists = num_blocks;
                         for ipass in 0..num_passes {
                             // A separate compute pass provides the
                             // storage-buffer visibility
@@ -7888,16 +7900,13 @@ fn simulate(
                             );
                             compute_pass.set_bind_group(0, bind_group, &[offset]);
 
-                            // For now, each thread serially merges a pair of
-                            // lists. A final
-                            // unpaired list is copied to the other ping-pong
-                            // half.
-                            let num_threads = num_lists.div_ceil(2);
-                            let num_workgroups = num_threads.div_ceil(64);
-                            compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
+                            // One thread per item, up to the capacity since
+                            // the count is only known on the GPU; rows of
+                            // `MAX_WORKGROUPS_PER_ROW` (see shader).
+                            let [x, y] = merge_workgroups(effect_batch.capacity);
+                            compute_pass.dispatch_workgroups(x, y, 1);
 
                             compute_pass.pop_debug_group();
-                            num_lists = num_lists.div_ceil(2);
                         }
                     }
 
