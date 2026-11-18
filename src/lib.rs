@@ -1106,6 +1106,29 @@ impl TextureLayout {
 #[derive(Debug, Default, Clone, PartialEq, Hash, Component)]
 pub struct EffectMesh(pub Handle<Mesh>);
 
+/// Optional point a particle effect is ordered by among other transparent
+/// objects.
+///
+/// Bevy draws transparent objects back to front, each at a single distance from
+/// the camera. An effect is placed at its origin, unless the entity of its
+/// [`ParticleEffect`] has this component, a point in world space. Set it where
+/// the particles are, if they spread far from the origin: a trail simulated in
+/// [`SimulationSpace::Global`] behind a moving emitter at the centre of its
+/// bounds, for example, so that what's beyond the trail draws behind it.
+///
+/// Effect instances batched into a single draw call are ordered by the first
+/// instance's point.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Component, Reflect)]
+#[reflect(Component)]
+pub struct EffectSortPoint(pub Vec3);
+
+impl EffectSortPoint {
+    /// The world-space point an effect at `transform` is ordered by.
+    pub(crate) fn resolve(point: Option<&Self>, transform: &GlobalTransform) -> Vec3 {
+        point.map_or(transform.translation(), |point| point.0)
+    }
+}
+
 /// Effect shaders.
 ///
 /// Contains the final shaders for the init, update, and render passes of a
@@ -3228,5 +3251,19 @@ else { return c1; }
             let sampler = dim.to_wgsl_sampler_type();
             assert_eq!(sampler.contains("comparison"), dim.is_depth());
         }
+    }
+
+    #[test]
+    fn sort_point_overrides_the_origin() {
+        let transform = GlobalTransform::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(
+            EffectSortPoint::resolve(None, &transform),
+            Vec3::new(1.0, 2.0, 3.0)
+        );
+        let point = EffectSortPoint(Vec3::new(-4.0, 0.0, 9.0));
+        assert_eq!(
+            EffectSortPoint::resolve(Some(&point), &transform),
+            Vec3::new(-4.0, 0.0, 9.0)
+        );
     }
 }

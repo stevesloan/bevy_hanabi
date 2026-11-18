@@ -48,8 +48,8 @@ use crate::{
     spawn::{self, Random},
     tick_spawners,
     time::effect_simulation_time_system,
-    update_properties_from_asset, EffectSimulation, EffectVisibilityClass, ParticleEffect,
-    SpawnerSettings,
+    update_properties_from_asset, EffectSimulation, EffectSortPoint, EffectVisibilityClass,
+    ParticleEffect, SpawnerSettings,
 };
 
 /// Source code for the `vfx_sort` compute shader.
@@ -230,6 +230,7 @@ impl Plugin for HanabiPlugin {
         app.register_type::<EffectAsset>()
             .register_type::<ParticleEffect>()
             .register_type::<EffectProperties>()
+            .register_type::<EffectSortPoint>()
             .register_type::<SpawnerSettings>()
             .register_type::<Time<EffectSimulation>>();
     }
