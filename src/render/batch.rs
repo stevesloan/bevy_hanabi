@@ -6,6 +6,7 @@ use bevy::{
     render::{
         render_resource::{Buffer, BufferVec, CachedComputePipelineId},
         renderer::{RenderDevice, RenderQueue},
+        storage::ShaderBuffer,
         sync_world::MainEntity,
     },
 };
@@ -189,6 +190,8 @@ pub(crate) struct EffectBatch {
     pub texture_layout: TextureLayout,
     /// Textures.
     pub textures: Vec<Handle<Image>>,
+    /// Storage buffers.
+    pub buffers: Vec<Handle<ShaderBuffer>>,
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
     pub cached_effect_events: Option<CachedEffectEvents>,
@@ -212,6 +215,7 @@ impl EffectBatch {
             || self.alpha_mode != input.alpha_mode
             || self.texture_layout != input.texture_layout
             || self.textures != input.textures
+            || self.buffers != input.buffers
             || self.property_key != input.property_key
             || self.parent_slab_id != input.parent_slab_id
             || self.parent_binding_source != input.parent_binding_source
@@ -794,6 +798,7 @@ impl EffectBatch {
             mesh: cached_mesh.mesh,
             texture_layout: extracted_effect.texture_layout.clone(),
             textures: extracted_effect.textures.clone(),
+            buffers: extracted_effect.buffers.clone(),
             alpha_mode: extracted_effect.alpha_mode,
             cached_effect_events: cached_effect_events.cloned(),
         }

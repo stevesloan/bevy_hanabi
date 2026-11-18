@@ -8,16 +8,17 @@ use bevy::{
     ecs::{lifecycle::Remove, observer::On, query::Without, system::Commands, world::Mut},
     image::Image,
     log::{error, trace},
-    platform::collections::{hash_map::EntryRef, HashMap},
+    platform::collections::HashMap,
     prelude::{Component, Entity, Query, Res, ResMut, Resource},
     render::{
         render_asset::RenderAssets,
         render_resource::{
             binding_types::{storage_buffer_read_only, storage_buffer_read_only_sized},
             BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-            PipelineCache, ShaderSize,
+            BufferId, PipelineCache, ShaderSize,
         },
         renderer::{RenderDevice, RenderQueue},
+        storage::{GpuShaderBuffer, ShaderBuffer},
         texture::GpuImage,
     },
     utils::default,
@@ -811,6 +812,8 @@ pub struct PropertyBindGroupKey {
     /// Textures bound to those points. The bind group binds them, so two
     /// effects with the same layout but different textures need their own.
     pub textures: Vec<AssetId<Image>>,
+    /// Buffers bound to the layout's buffer slots, likewise.
+    pub buffers: Vec<AssetId<ShaderBuffer>>,
 }
 
 // Note: use by HashMap to turn a key reference into an owned key when inserting
@@ -827,22 +830,29 @@ impl PropertyBindGroupKey {
         properties: &CachedEffectProperties,
         texture_layout: TextureLayout,
         textures: Vec<AssetId<Image>>,
+        buffers: Vec<AssetId<ShaderBuffer>>,
     ) -> Self {
         Self {
             buffer_index: properties.buffer_index,
             binding_size: properties.property_layout.min_binding_size().get() as u32,
             texture_layout,
             textures,
+            buffers,
         }
     }
 
     /// Get a key for an effect without property.
-    pub fn texture_only(texture_layout: TextureLayout, textures: Vec<AssetId<Image>>) -> Self {
+    pub fn texture_only(
+        texture_layout: TextureLayout,
+        textures: Vec<AssetId<Image>>,
+        buffers: Vec<AssetId<ShaderBuffer>>,
+    ) -> Self {
         Self {
             buffer_index: 0,
             binding_size: 0,
             texture_layout,
             textures,
+            buffers,
         }
     }
 
@@ -859,8 +869,9 @@ impl PropertyBindGroupKey {
 #[derive(Default, Resource)]
 pub struct PropertyBindGroups {
     /// Map from a [`PropertyBuffer`] index and a binding size to the
-    /// corresponding bind group.
-    property_bind_groups: HashMap<PropertyBindGroupKey, [BindGroup; 2]>,
+    /// corresponding bind group, with the GPU buffers it binds to the
+    /// material's buffer slots.
+    property_bind_groups: HashMap<PropertyBindGroupKey, ([BindGroup; 2], Vec<BufferId>)>,
 }
 
 #[derive(Debug, Error)]
@@ -894,6 +905,7 @@ impl PropertyBindGroups {
         render_device: &RenderDevice,
         pipeline_cache: &PipelineCache,
         gpu_images: &RenderAssets<GpuImage>,
+        gpu_buffers: Option<&RenderAssets<GpuShaderBuffer>>,
     ) -> Result<BindGroup, PropertyBindGroupError> {
         trace!(
             "Creating new spawner@2 bind group for property buffer #{} and binding size {} (w/ prefix sum: {})",
@@ -955,10 +967,11 @@ impl PropertyBindGroups {
         let material = Material {
             layout: texture_layout.clone(),
             textures: textures.iter().map(|h| h.id()).collect(),
+            buffers: property_key.buffers.clone(),
         };
         assert_eq!(material.layout.layout.len(), material.textures.len());
         material
-            .append_binding_entries(4, gpu_images, &mut entries)
+            .append_binding_entries(4, gpu_images, gpu_buffers, &mut entries)
             .map_err(PropertyBindGroupError::Material)?;
 
         trace!("Creating @2 bind group with {} entries:", entries.len());
@@ -1005,6 +1018,7 @@ impl PropertyBindGroups {
         render_device: &RenderDevice,
         pipeline_cache: &PipelineCache,
         gpu_images: &RenderAssets<GpuImage>,
+        gpu_buffers: Option<&RenderAssets<GpuShaderBuffer>>,
     ) -> Result<(), PropertyBindGroupError> {
         trace!("PropertyBindGroups::ensure_exists() key={property_key:?}");
 
@@ -1019,40 +1033,41 @@ impl PropertyBindGroups {
             None
         };
 
-        match self.property_bind_groups.entry_ref(property_key) {
-            EntryRef::Vacant(entry) => {
-                let without = Self::make_bind_group(
-                    property_key,
-                    property_cache,
-                    false,
-                    texture_layout,
-                    textures,
-                    spawner_buffer,
-                    prefix_sum_buffer,
-                    batch_info_buffer,
-                    property_buffer,
-                    render_device,
-                    pipeline_cache,
-                    gpu_images,
-                )?;
-                let with = Self::make_bind_group(
-                    property_key,
-                    property_cache,
-                    true,
-                    texture_layout,
-                    textures,
-                    spawner_buffer,
-                    prefix_sum_buffer,
-                    batch_info_buffer,
-                    property_buffer,
-                    render_device,
-                    pipeline_cache,
-                    gpu_images,
-                )?;
-                entry.insert([without, with]);
+        let buffer_ids = match Material::gpu_buffer_ids(&property_key.buffers, gpu_buffers) {
+            Ok(ids) => ids,
+            Err(err) => {
+                // Not one bound to a buffer that's gone.
+                self.property_bind_groups.remove(property_key);
+                return Err(PropertyBindGroupError::Material(err));
             }
-            EntryRef::Occupied(_) => (),
         };
+        if self
+            .property_bind_groups
+            .get(property_key)
+            .is_some_and(|(_, bound)| *bound == buffer_ids)
+        {
+            return Ok(());
+        }
+        let make = |with_prefix_sum| {
+            Self::make_bind_group(
+                property_key,
+                property_cache,
+                with_prefix_sum,
+                texture_layout,
+                textures,
+                spawner_buffer,
+                prefix_sum_buffer,
+                batch_info_buffer,
+                property_buffer,
+                render_device,
+                pipeline_cache,
+                gpu_images,
+                gpu_buffers,
+            )
+        };
+        let bind_groups = [make(false)?, make(true)?];
+        self.property_bind_groups
+            .insert(property_key.clone(), (bind_groups, buffer_ids));
         Ok(())
     }
 
@@ -1060,7 +1075,7 @@ impl PropertyBindGroups {
     pub fn get(&self, key: &PropertyBindGroupKey, with_prefix_sum: bool) -> Option<&BindGroup> {
         self.property_bind_groups
             .get(key)
-            .map(|arr| &arr[with_prefix_sum as usize])
+            .map(|(arr, _)| &arr[with_prefix_sum as usize])
     }
 }
 
@@ -1296,17 +1311,36 @@ mod gpu_tests {
                 name: "color".into(),
                 dimension: crate::SlotDimension::D2,
             }],
+            ..default()
         };
         let image = |n: u128| AssetId::<Image>::Uuid {
             uuid: bevy::asset::uuid::Uuid::from_u128(n),
         };
-        let a = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(1)]);
-        let b = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(2)]);
+        let a = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(1)], vec![]);
+        let b = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(2)], vec![]);
         assert_ne!(a, b);
         assert_eq!(
             a,
-            PropertyBindGroupKey::texture_only(layout, vec![image(1)])
+            PropertyBindGroupKey::texture_only(layout, vec![image(1)], vec![])
         );
+    }
+
+    /// Likewise buffers.
+    #[test]
+    fn bind_group_key_tells_buffers_apart() {
+        let layout = crate::TextureLayout {
+            buffers: vec![crate::BufferSlot {
+                name: "list".into(),
+                element: "vec4<f32>".into(),
+            }],
+            ..default()
+        };
+        let buffer = |n: u128| AssetId::<ShaderBuffer>::Uuid {
+            uuid: bevy::asset::uuid::Uuid::from_u128(n),
+        };
+        let a = PropertyBindGroupKey::texture_only(layout.clone(), vec![], vec![buffer(1)]);
+        let b = PropertyBindGroupKey::texture_only(layout, vec![], vec![buffer(2)]);
+        assert_ne!(a, b);
     }
 
     #[test]

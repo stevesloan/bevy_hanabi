@@ -216,6 +216,7 @@ fn setup(
             ParticleEffect::new(head_effect),
             EffectMaterial {
                 images: vec![circle.clone()],
+                ..default()
             },
         ))
         .id();

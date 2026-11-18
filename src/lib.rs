@@ -187,7 +187,7 @@ use bevy::{
     prelude::*,
     render::{
         extract_component::ExtractComponent, render_resource::IntoBindGroupLayoutEntryBuilder as _,
-        sync_world::SyncToRenderWorld,
+        storage::ShaderBuffer, sync_world::SyncToRenderWorld,
     },
 };
 use rand::{RngExt as _, SeedableRng as _};
@@ -222,8 +222,8 @@ pub use render::{DebugSettings, LayoutFlags, ShaderCache};
 pub use spawn::{tick_spawners, CpuValue, EffectSpawner, Random, SpawnerSettings};
 pub use time::{EffectSimulation, EffectSimulationTime};
 use wgpu::{
-    BindGroupLayoutEntry, BindingType, SamplerBindingType, ShaderStages, TextureDescriptor,
-    TextureDimension, TextureSampleType, TextureViewDimension,
+    BindGroupLayoutEntry, BindingType, BufferBindingType, SamplerBindingType, ShaderStages,
+    TextureDescriptor, TextureDimension, TextureSampleType, TextureViewDimension,
 };
 
 #[allow(missing_docs)]
@@ -741,6 +741,9 @@ pub struct EffectMaterial {
     ///
     /// [slot index]: crate::TextureLayout::get_slot_by_name
     pub images: Vec<Handle<Image>>,
+
+    /// Storage buffers for the effect's [`BufferSlot`]s, by slot index.
+    pub buffers: Vec<Handle<ShaderBuffer>>,
 }
 
 /// Dimension of a texture for a material slot.
@@ -1014,6 +1017,38 @@ pub struct TextureLayout {
     /// in [`EffectMaterial::images`] maps by index to a unique slot in this
     /// array.
     pub layout: Vec<TextureSlot>,
+    /// Read-only storage buffers, bound after the textures. Each
+    /// [`EffectMaterial::buffers`] entry maps by index to a slot in this array.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<BufferSlot>,
+}
+
+/// Buffer slot of a [`Module`].
+///
+/// A named bind point for a read-only storage buffer, declared in the init,
+/// update and render shaders as
+/// `var<storage, read> material_buffer_N: array<element>`, where `N` is the
+/// slot's index. Custom modifier code reads it; there's no expression for it.
+///
+/// The buffer is a [`ShaderBuffer`] given by [`EffectMaterial::buffers`]. An
+/// effect whose buffer isn't on the GPU yet isn't simulated or drawn.
+///
+/// [`ShaderBuffer`]: bevy::render::storage::ShaderBuffer
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect, Serialize, Deserialize)]
+pub struct BufferSlot {
+    /// Unique slot name.
+    pub name: String,
+    /// WGSL type of the array's elements. Every stage's shader declares the
+    /// binding, so a type other than a built-in one must be declared in all
+    /// three.
+    pub element: String,
+}
+
+impl BufferSlot {
+    /// WGSL name of the binding of the slot at `index`.
+    pub fn wgsl_name(index: usize) -> String {
+        format!("material_buffer_{index}")
+    }
 }
 
 impl TextureLayout {
@@ -1074,14 +1109,29 @@ impl TextureLayout {
             );
             bind_index += 2;
         }
+        for _ in &self.buffers {
+            entries.push(
+                BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                }
+                .into_bind_group_layout_entry_builder()
+                .build(
+                    bind_index,
+                    ShaderStages::COMPUTE | ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ),
+            );
+            bind_index += 1;
+        }
     }
 
     /// Generate the WGSL code for the material bindings of this layout.
     pub fn to_wgsl_binding(&self, group_index: u32, start_index: u32) -> String {
-        if self.layout.is_empty() {
+        if self.layout.is_empty() && self.buffers.is_empty() {
             return String::new();
         }
-        let mut code = String::with_capacity(160 * self.layout.len());
+        let mut code = String::with_capacity(160 * (self.layout.len() + self.buffers.len()));
         let mut bind_index = start_index;
         for (slot_index, slot) in self.layout.iter().enumerate() {
             let tex_index = bind_index;
@@ -1094,6 +1144,14 @@ impl TextureLayout {
 "
             ));
             bind_index += 2;
+        }
+        for (slot_index, slot) in self.buffers.iter().enumerate() {
+            code.push_str(&format!(
+                "@group({group_index}) @binding({bind_index}) var<storage, read> {}: array<{}>;\n",
+                BufferSlot::wgsl_name(slot_index),
+                slot.element,
+            ));
+            bind_index += 1;
         }
         code
     }
@@ -1757,6 +1815,8 @@ pub struct CompiledParticleEffect {
     effect_shader: Option<EffectShaders>,
     /// Textures used by the effect, if any.
     textures: Vec<Handle<Image>>,
+    /// Storage buffers used by the effect, if any.
+    buffers: Vec<Handle<ShaderBuffer>>,
     /// Layout flags.
     layout_flags: LayoutFlags,
     /// Alpha mode.
@@ -1779,6 +1839,7 @@ impl Default for CompiledParticleEffect {
             mesh: None,
             effect_shader: None,
             textures: vec![],
+            buffers: vec![],
             layout_flags: LayoutFlags::NONE,
             alpha_mode: default(),
             parent_particle_layout: None,
@@ -1806,6 +1867,7 @@ impl CompiledParticleEffect {
         self.asset = Handle::default();
         self.effect_shader = None;
         self.textures.clear();
+        self.buffers.clear();
     }
 
     /// Update the compiled effect from its asset and instance.
@@ -1934,6 +1996,10 @@ impl CompiledParticleEffect {
         }
 
         self.textures = material.map(|mat| &mat.images).cloned().unwrap_or_default();
+        self.buffers = material
+            .map(|mat| &mat.buffers)
+            .cloned()
+            .unwrap_or_default();
     }
 
     /// Get the effect shader if configured, or `None` otherwise.
@@ -2294,6 +2360,39 @@ mod tests {
 
     /// Same as `INTS`, rounded up to 16
     const INTS16: &[usize] = &[16, 16, 16, 16, 16, 16, 16, 32, 32, 32, 32, 32, 48];
+
+    /// Buffers bind after the textures, each one binding, in slot order.
+    #[test]
+    fn buffer_slots_bind_after_textures() {
+        let mut module = Module::default();
+        module.add_texture_slot("color", SlotDimension::D2);
+        assert_eq!(module.add_buffer_slot("list", "vec4<f32>"), 0);
+        assert_eq!(module.add_buffer_slot("more", "u32"), 1);
+        let layout = module.texture_layout();
+        let code = layout.to_wgsl_binding(2, 4);
+        assert!(
+            code.contains("@binding(4) var material_texture_0"),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "@group(2) @binding(6) var<storage, read> material_buffer_0: array<vec4<f32>>;"
+            ),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "@group(2) @binding(7) var<storage, read> material_buffer_1: array<u32>;"
+            ),
+            "{code}"
+        );
+        let mut entries = vec![];
+        layout.append_layout_bindings(4, &mut entries);
+        assert_eq!(
+            entries.iter().map(|e| e.binding).collect::<Vec<_>>(),
+            [4, 5, 6, 7]
+        );
+    }
 
     #[test]
     fn next_multiple() {
