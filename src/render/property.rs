@@ -4,7 +4,7 @@ use std::{
 };
 
 use bevy::{
-    asset::Handle,
+    asset::{AssetId, Handle},
     ecs::{lifecycle::Remove, observer::On, query::Without, system::Commands, world::Mut},
     image::Image,
     log::{error, trace},
@@ -808,6 +808,9 @@ pub struct PropertyBindGroupKey {
     pub binding_size: u32,
     /// Texture layout for the material binding points.
     pub texture_layout: TextureLayout,
+    /// Textures bound to those points. The bind group binds them, so two
+    /// effects with the same layout but different textures need their own.
+    pub textures: Vec<AssetId<Image>>,
 }
 
 // Note: use by HashMap to turn a key reference into an owned key when inserting
@@ -820,20 +823,26 @@ impl From<&PropertyBindGroupKey> for PropertyBindGroupKey {
 }
 
 impl PropertyBindGroupKey {
-    pub fn new(properties: &CachedEffectProperties, texture_layout: TextureLayout) -> Self {
+    pub fn new(
+        properties: &CachedEffectProperties,
+        texture_layout: TextureLayout,
+        textures: Vec<AssetId<Image>>,
+    ) -> Self {
         Self {
             buffer_index: properties.buffer_index,
             binding_size: properties.property_layout.min_binding_size().get() as u32,
             texture_layout,
+            textures,
         }
     }
 
     /// Get a key for an effect without property.
-    pub fn texture_only(texture_layout: TextureLayout) -> Self {
+    pub fn texture_only(texture_layout: TextureLayout, textures: Vec<AssetId<Image>>) -> Self {
         Self {
             buffer_index: 0,
             binding_size: 0,
             texture_layout,
+            textures,
         }
     }
 
@@ -1275,6 +1284,29 @@ mod gpu_tests {
         buffer
             .get_mapped_range()
             .expect("Buffer must be mapped for reading")
+    }
+
+    /// Effects with the same texture layout but different textures must not
+    /// share a bind group: it binds the textures, so the first effect's
+    /// would be drawn by every other.
+    #[test]
+    fn bind_group_key_tells_textures_apart() {
+        let layout = crate::TextureLayout {
+            layout: vec![crate::TextureSlot {
+                name: "color".into(),
+                dimension: crate::SlotDimension::D2,
+            }],
+        };
+        let image = |n: u128| AssetId::<Image>::Uuid {
+            uuid: bevy::asset::uuid::Uuid::from_u128(n),
+        };
+        let a = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(1)]);
+        let b = PropertyBindGroupKey::texture_only(layout.clone(), vec![image(2)]);
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            PropertyBindGroupKey::texture_only(layout, vec![image(1)])
+        );
     }
 
     #[test]
