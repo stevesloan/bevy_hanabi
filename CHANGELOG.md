@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the camera, each ordered at its band's middle, so other transparent objects inside a
   widespread effect are ordered against the nearby particles rather than the whole effect.
 
+### Fixed
+
+- `BufferTable::remove()` drops the free rows it leaves at the end of the table, as
+  `remove_range()` does. A table freed by both failed `remove_range()`'s check.
+
 ## [0.20.0] 2026-11-01
 
 _This version is compatible with Bevy 0.20_
