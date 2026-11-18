@@ -5,6 +5,7 @@ use bytemuck::{cast_slice, Pod, Zeroable};
 use futures::channel::oneshot;
 use wgpu::util::DeviceExt;
 
+use super::sort::GpuMergeParams;
 use super::*;
 use crate::{
     plugin::VFX_SORT_WESL, test_utils::MockRenderer, Attribute, EffectAsset, EffectShaderSources,
@@ -577,6 +578,16 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
     let wgpu_device = device.wgpu_device();
     let storage_alignment = device.limits().min_storage_buffer_offset_alignment;
     let count = distances.len() as u32;
+    // Lists of the block sort's 1024, doubling until one holds every pair.
+    let merge_params: Vec<GpuMergeParams> = (0..)
+        .map(|pass: u32| 1024_u32 << pass)
+        .take_while(|&list| list < count)
+        .enumerate()
+        .map(|(pass, list)| GpuMergeParams {
+            max_list_size: list,
+            source_buffer: pass as u32 % 2,
+        })
+        .collect();
 
     let fill_shader = create_composed_shader_module(
         &device,
@@ -638,12 +649,14 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
     });
     let copy_source_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("hanabi:test:slices:copy_source"),
-        contents: cast_slice(&[0_u32, 0]),
+        // The copy reads the half the last merge wrote.
+        contents: cast_slice(&[0_u32, merge_params.len() as u32 % 2]),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let sort_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("hanabi:test:slices:sort"),
-        size: 4 + 12 * count as u64,
+        // Both ping-pong halves.
+        size: 4 + 2 * 12 * count as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -662,10 +675,14 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
         contents: cast_slice(&draw_args),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     });
-    let dispatch_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("hanabi:test:slices:dispatch"),
-        contents: cast_slice(&[GpuDispatchIndirectArgs { x: 1, y: 1, z: 1 }]),
-        usage: wgpu::BufferUsages::INDIRECT,
+    let merge_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hanabi:test:slices:merge"),
+        // One entry at least: a binding can't be empty.
+        contents: &padded_slice_content(
+            &[&merge_params[..], &[GpuMergeParams::default()]].concat(),
+            storage_alignment,
+        ),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     let storage = |binding, read_only, dynamic| wgpu::BindGroupLayoutEntry {
@@ -764,18 +781,53 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
         label: Some("hanabi:test:slices:chain"),
     });
     encoder.clear_buffer(&sort_buffer, 0, Some(4));
-    for (pipeline, bind_group, offsets) in [
-        (&fill_pipeline, &fill_bg, &[0_u32][..]),
-        (&sort_pipeline, &sort_bg, &[][..]),
-        (&copy_pipeline, &copy_bg, &[0, 0][..]),
-    ] {
+    let merge_bgl = wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("hanabi:test:slices:merge:bgl"),
+        entries: &[storage(0, false, false), storage(1, true, true)],
+    });
+    let merge_bg = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hanabi:test:slices:merge:bg"),
+        layout: &merge_bgl,
+        entries: &entries([
+            sort_buffer.as_entire_binding(),
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &merge_buffer,
+                offset: 0,
+                size: NonZeroU64::new(GpuMergeParams::min_size().get()),
+            }),
+        ]),
+    });
+    let merge_source = crate::test_utils::compile_wesl(
+        crate::plugin::VFX_SORT_MERGE_WESL.as_ref(),
+        &["HAS_DUAL_KEY"],
+        &[],
+    )
+    .unwrap();
+    let merge_shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("hanabi:test:slices:merge"),
+        source: wgpu::ShaderSource::Wgsl(merge_source.into()),
+    });
+    let merge_pipeline = pipeline("hanabi:test:slices:merge", &merge_bgl, &merge_shader, "merge_sort");
+    let merge_stride = (GpuMergeParams::min_size().get() as u32).next_multiple_of(storage_alignment);
+
+    let per_thread = count.div_ceil(64);
+    let mut passes = vec![
+        (&fill_pipeline, &fill_bg, vec![0_u32], per_thread),
+        (&sort_pipeline, &sort_bg, vec![], count.div_ceil(1024)),
+    ];
+    for pass in 0..merge_params.len() as u32 {
+        passes.push((&merge_pipeline, &merge_bg, vec![pass * merge_stride], per_thread));
+    }
+    passes.push((&copy_pipeline, &copy_bg, vec![0, 0], per_thread));
+    // A pass each, as the real chain: storage writes are visible to the next.
+    for (pipeline, bind_group, offsets, workgroups) in &passes {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("hanabi:test:slices:pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, offsets);
-        pass.dispatch_workgroups_indirect(&dispatch_buffer, 0);
+        pass.set_bind_group(0, *bind_group, offsets);
+        pass.dispatch_workgroups(*workgroups, 1, 1);
     }
     submit_and_wait(&device, &queue, encoder.finish());
 
@@ -807,6 +859,35 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
         .map(|args| args.instance_count)
         .collect();
     (spawner_out.depth_slice_rows, sorted, band_counts)
+}
+
+/// More particles than the sort buffer first holds (131,072), through
+/// every merge pass: drawn far to near, with the depth slices found in that
+/// order.
+#[test]
+fn real_sort_orders_many_particles_far_to_near() {
+    // Deterministic, spread, with some exact repeats.
+    let distances: Vec<f32> = (0..150_000_u32)
+        .map(|i| ((i.wrapping_mul(2654435761) >> 8) % 50_000) as f32 * 0.002)
+        .collect();
+    let (rows, sorted, bands) = sort_depth_slices(&distances, &[4.0, 10.0, 25.0, 60.0]);
+    assert_eq!(sorted.len(), distances.len());
+    let order: Vec<f32> = sorted.iter().map(|&i| distances[i as usize]).collect();
+    assert!(
+        order.windows(2).all(|w| w[0] >= w[1]),
+        "not far to near: first fault at {:?}",
+        order.windows(2).position(|w| w[0] < w[1])
+    );
+    let mut seen = sorted.clone();
+    seen.sort_unstable();
+    assert!(seen.iter().copied().eq(0..distances.len() as u32), "each particle once");
+    let at_least = |edge: f32| distances.iter().filter(|&&d| d >= edge).count() as u32;
+    assert_eq!(
+        &rows[..5],
+        &[at_least(4.0), at_least(10.0), at_least(25.0), at_least(60.0), 150_000]
+    );
+    let total: u32 = bands[..5].iter().sum();
+    assert_eq!(total, 150_000);
 }
 
 #[test]
