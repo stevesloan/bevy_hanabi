@@ -42,23 +42,34 @@ pub(crate) struct GpuMergeParams {
     pub source_buffer: u32,
 }
 
+/// Byte offsets in a particle of the primary and secondary keys its effect's
+/// particles are sorted by: the internal sort key twice for an effect drawn
+/// back-to-front, else a ribbon's `RIBBON_ID` then `AGE`. `None` if the
+/// layout has neither.
+pub(crate) fn sort_key_offsets(particle_layout: &ParticleLayout) -> Option<(u32, u32)> {
+    if let Some(key) = particle_layout.byte_offset(Attribute::SORT_KEY) {
+        return Some((key, key));
+    }
+    let ribbon_id = particle_layout.byte_offset(Attribute::RIBBON_ID)?;
+    let age = particle_layout.byte_offset(Attribute::AGE)?;
+    Some((ribbon_id, age))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SortFillBindGroupLayoutKey {
     particle_min_binding_size: NonZeroU32,
-    particle_ribbon_id_offset: u32,
-    particle_age_offset: u32,
+    particle_key_offset: u32,
+    particle_key2_offset: u32,
 }
 
 impl SortFillBindGroupLayoutKey {
     pub fn from_particle_layout(particle_layout: &ParticleLayout) -> Result<Self, ()> {
-        let particle_ribbon_id_offset = particle_layout
-            .byte_offset(Attribute::RIBBON_ID)
-            .ok_or(())?;
-        let particle_age_offset = particle_layout.byte_offset(Attribute::AGE).ok_or(())?;
+        let (particle_key_offset, particle_key2_offset) =
+            sort_key_offsets(particle_layout).ok_or(())?;
         let key = SortFillBindGroupLayoutKey {
             particle_min_binding_size: particle_layout.min_binding_size32(),
-            particle_ribbon_id_offset,
-            particle_age_offset,
+            particle_key_offset,
+            particle_key2_offset,
         };
         Ok(key)
     }

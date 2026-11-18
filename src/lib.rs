@@ -40,7 +40,7 @@
 //!
 //! ```toml
 //! # Example: enable only 3D integration
-//! bevy_hanabi = { version = "0.19", default-features = false, features = ["3d"] }
+//! bevy_hanabi = { version = "0.20", default-features = false, features = ["3d"] }
 //! ```
 //!
 //! # Example
@@ -210,7 +210,7 @@ mod test_utils;
 
 pub use asset::{
     AlphaMode, DefaultMesh, EffectAsset, EffectAssetDeserializer, EffectAssetLoader,
-    EffectAssetSerializer, EffectParent, MotionIntegration, SimulationCondition,
+    EffectAssetSerializer, EffectParent, MotionIntegration, SimulationCondition, SortMode,
 };
 pub use attributes::*;
 pub use gradient::{Gradient, GradientKey};
@@ -798,6 +798,9 @@ impl SlotDimension {
     ///
     /// Array textures require an addition `array_index` when loading a value or
     /// sampling the texture. See [`TextureSampleExpr`] and [`TextureLoadExpr`].
+    ///
+    /// [`TextureSampleExpr`]: graph::expr::TextureSampleExpr
+    /// [`TextureLoadExpr`]: graph::expr::TextureLoadExpr
     pub fn is_array(&self) -> bool {
         matches!(
             *self,
@@ -828,6 +831,8 @@ impl SlotDimension {
     /// Cube textures have some usage restrictions. In particular, you cannot
     /// use them with a [`TextureLoadExpr`]. They always need a multiple of 6
     /// layers (and exactly 6 if not an array).
+    ///
+    /// [`TextureLoadExpr`]: graph::expr::TextureLoadExpr
     pub fn is_cube(&self) -> bool {
         matches!(
             *self,
@@ -1213,6 +1218,17 @@ impl EffectShaderSources {
             )));
         }
 
+        // Ribbons are drawn in the order they're sorted in to be meshed, so
+        // can't also be sorted by distance.
+        if particle_layout.contains(Attribute::RIBBON_ID) && asset.sort_mode != SortMode::None {
+            return Err(ShaderGenerateError::Validate(format!(
+                "The asset '{}' uses ribbons (has the '{}' attribute), which are always drawn in ribbon order, but also sets sort_mode to {:?}. Set sort_mode to SortMode::None.",
+                asset.name,
+                Attribute::RIBBON_ID.name().to_ascii_uppercase(),
+                asset.sort_mode
+            )));
+        }
+
         // Generate the WGSL code declaring all the attributes inside the
         // Particle struct.
         let attributes_code = particle_layout.generate_code();
@@ -1380,6 +1396,9 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
         if asset.simulation_space == SimulationSpace::Local {
             layout_flags |= LayoutFlags::LOCAL_SPACE_SIMULATION;
         }
+        if asset.sort_mode == SortMode::BackToFront {
+            layout_flags |= LayoutFlags::SORT_BACK_TO_FRONT;
+        }
         match &asset.alpha_mode {
             AlphaMode::Mask(_) => layout_flags.insert(LayoutFlags::USE_ALPHA_MASK),
             AlphaMode::Opaque => layout_flags.insert(LayoutFlags::OPAQUE),
@@ -1532,6 +1551,20 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
                         }
                     )
             }
+        }
+
+        // Back-to-front order: the key is the distance to the camera's bits,
+        // inverted, so the sort's ascending order draws the farthest first.
+        // Written after motion integration, from where the particle is drawn
+        // this frame.
+        if asset.sort_mode == SortMode::BackToFront {
+            write!(
+                &mut update_code,
+                "\n{{\n    let sort_world_position = transform_position_simulation_to_world(particle.{0}).xyz;\n    particle.{1} = ~bitcast<u32>(distance(sort_world_position, sim_params.camera_position.xyz));\n}}\n",
+                Attribute::POSITION.name(),
+                Attribute::SORT_KEY.name(),
+            )
+            .unwrap();
         }
 
         // Generate the shader code for the render shader
@@ -2711,6 +2744,74 @@ else { return c1; }
             .validate(&module)
             .unwrap();
         }
+    }
+
+    #[test]
+    fn test_effect_shader_source_sort_back_to_front() {
+        for space in [SimulationSpace::Global, SimulationSpace::Local] {
+            let mut module = Module::default();
+            let zero = module.lit(Vec3::ZERO);
+            let asset = EffectAsset::new(256, SpawnerSettings::rate(32.0.into()), module)
+                .with_simulation_space(space)
+                .with_sort_mode(SortMode::BackToFront)
+                .init(SetAttributeModifier::new(Attribute::POSITION, zero));
+            assert!(asset.particle_layout().contains(Attribute::SORT_KEY));
+            let sources = EffectShaderSources::generate(&asset, None, 0).unwrap();
+            assert!(sources.layout_flags.needs_sort());
+            assert!(sources
+                .update_shader_source
+                .contains(&format!("particle.{} =", Attribute::SORT_KEY.name())));
+
+            // The key's code is valid in the update shader, in either space.
+            let common_shader = HanabiPlugin::make_common_shader(256);
+            let defines: &[&str] = if space == SimulationSpace::Local {
+                &["LOCAL_SPACE_SIMULATION"]
+            } else {
+                &[]
+            };
+            let wgsl = crate::test_utils::compile_wesl(
+                &sources.update_shader_source,
+                defines,
+                &[(
+                    "bevy_hanabi::render::vfx_common",
+                    common_shader.source.as_str(),
+                )],
+            )
+            .unwrap_or_else(|error| panic!("{}", error.diagnostic().render_plain()));
+            let module = naga::front::wgsl::parse_str(&wgsl).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+
+        // Unsorted by default, without the key.
+        let mut module = Module::default();
+        let zero = module.lit(Vec3::ZERO);
+        let asset = EffectAsset::new(256, SpawnerSettings::rate(32.0.into()), module)
+            .init(SetAttributeModifier::new(Attribute::POSITION, zero));
+        assert!(!asset.particle_layout().contains(Attribute::SORT_KEY));
+        let sources = EffectShaderSources::generate(&asset, None, 0).unwrap();
+        assert!(!sources.layout_flags.needs_sort());
+
+        // Ribbons are drawn in ribbon order, so can't also be sorted.
+        let mut module = Module::default();
+        let zero = module.lit(Vec3::ZERO);
+        let ribbon = module.lit(0u32);
+        let age = module.lit(0f32);
+        let asset = EffectAsset::new(256, SpawnerSettings::rate(32.0.into()), module)
+            .with_sort_mode(SortMode::BackToFront)
+            .init(SetAttributeModifier::new(Attribute::POSITION, zero))
+            .init(SetAttributeModifier::new(Attribute::RIBBON_ID, ribbon))
+            .init(SetAttributeModifier::new(Attribute::AGE, age));
+        let res = EffectShaderSources::generate(&asset, None, 0);
+        assert!(
+            matches!(res, Err(ShaderGenerateError::Validate(_))),
+            "{:?}",
+            res.err()
+        );
     }
 
     #[test]

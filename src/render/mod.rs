@@ -3234,6 +3234,19 @@ bitflags! {
         const READ_PARENT_PARTICLE = (1 << 11);
         /// The effect access to the particle data in the fragment shader.
         const NEEDS_PARTICLE_FRAGMENT = (1 << 12);
+        /// The effect's particles are sorted to be drawn from the farthest to
+        /// the nearest (see [`SortMode::BackToFront`]).
+        ///
+        /// [`SortMode::BackToFront`]: crate::SortMode::BackToFront
+        const SORT_BACK_TO_FRONT = (1 << 13);
+    }
+}
+
+impl LayoutFlags {
+    /// Whether the effect's particles are sorted on the GPU each frame after
+    /// their update: ribbons, to mesh them in order, or for draw order.
+    pub fn needs_sort(&self) -> bool {
+        self.intersects(Self::RIBBONS | Self::SORT_BACK_TO_FRONT)
     }
 }
 
@@ -4583,8 +4596,8 @@ pub(crate) fn prepare_batch_inputs(
 
         // For ribbons, we need the sorting pipeline to be ready to sort the
         // ribbon's particles by age in order to build a contiguous
-        // mesh.
-        if extracted_effect.layout_flags.contains(LayoutFlags::RIBBONS) {
+        // mesh. Likewise for effects drawn back-to-front.
+        if extracted_effect.layout_flags.needs_sort() {
             // Ensure the bind group layout for sort-fill is ready. This will
             // also ensure the pipeline is created and queued if
             // needed.
@@ -4814,28 +4827,28 @@ pub(crate) fn batch_effects(
         // If the batch has ribbons, we need to sort the particles by RIBBON_ID
         // and AGE for ribbon meshing, in order to avoid gaps when some
         // particles in the middle of the ribbon die (since we can't
-        // guarantee a linear lifetime through the ribbon).
-        let sort_indirect_dispatch_indices =
-            if extracted_effect.layout_flags.contains(LayoutFlags::RIBBONS) {
-                // Allocate a GpuDispatchIndirect entry
-                let sort_fill_indirect_dispatch_index = sort_bind_groups.allocate_indirect_args();
-                effect_batch.effect_data[0].sort_fill_indirect_dispatch_index =
-                    Some(sort_fill_indirect_dispatch_index);
+        // guarantee a linear lifetime through the ribbon). Effects drawn
+        // back-to-front are sorted by their distance to the camera.
+        let sort_indirect_dispatch_indices = if extracted_effect.layout_flags.needs_sort() {
+            // Allocate a GpuDispatchIndirect entry
+            let sort_fill_indirect_dispatch_index = sort_bind_groups.allocate_indirect_args();
+            effect_batch.effect_data[0].sort_fill_indirect_dispatch_index =
+                Some(sort_fill_indirect_dispatch_index);
 
-                let sort_indirect_dispatch_index = sort_bind_groups.allocate_indirect_args();
-                effect_batch.effect_data[0].sort_indirect_dispatch_index =
-                    Some(sort_indirect_dispatch_index);
+            let sort_indirect_dispatch_index = sort_bind_groups.allocate_indirect_args();
+            effect_batch.effect_data[0].sort_indirect_dispatch_index =
+                Some(sort_indirect_dispatch_index);
 
-                // Ensure sort merge passes are allocated, if needed
-                sort_bind_groups.ensure_mergesort_passes(extracted_effect.capacity);
+            // Ensure sort merge passes are allocated, if needed
+            sort_bind_groups.ensure_mergesort_passes(extracted_effect.capacity);
 
-                Some((
-                    sort_fill_indirect_dispatch_index,
-                    sort_indirect_dispatch_index,
-                ))
-            } else {
-                None
-            };
+            Some((
+                sort_fill_indirect_dispatch_index,
+                sort_indirect_dispatch_index,
+            ))
+        } else {
+            None
+        };
 
         // Append to sorted compute batches; this may merge with the previous
         // one.
@@ -6309,16 +6322,10 @@ pub(crate) fn prepare_effect_metadata(
             .unwrap_or(u32::MAX);
 
         let particle_stride = extracted_effect.particle_layout.min_binding_size32().get() / 4;
-        let sort_key_offset = extracted_effect
-            .particle_layout
-            .byte_offset(Attribute::RIBBON_ID)
-            .map(|byte_offset| byte_offset / 4)
-            .unwrap_or(u32::MAX);
-        let sort_key2_offset = extracted_effect
-            .particle_layout
-            .byte_offset(Attribute::AGE)
-            .map(|byte_offset| byte_offset / 4)
-            .unwrap_or(u32::MAX);
+        let (sort_key_offset, sort_key2_offset) =
+            sort::sort_key_offsets(&extracted_effect.particle_layout)
+                .map(|(key, key2)| (key / 4, key2 / 4))
+                .unwrap_or((u32::MAX, u32::MAX));
 
         let gpu_effect_metadata = GpuEffectMetadata {
             capacity,
@@ -6788,7 +6795,7 @@ pub(crate) fn prepare_bind_groups(
             }
         }
 
-        if effect_batch.layout_flags.contains(LayoutFlags::RIBBONS) {
+        if effect_batch.layout_flags.needs_sort() {
             let effect_buffer = effect_cache.get_slab(&effect_batch.slab_id).unwrap();
 
             // Bind group @0 of sort-fill pass
@@ -7593,7 +7600,7 @@ fn simulate(
             };
 
             // Remember if we need to sort any effect, for next pass
-            if effect_batch.layout_flags.contains(LayoutFlags::RIBBONS) {
+            if effect_batch.layout_flags.needs_sort() {
                 needs_sort = true;
             }
 
@@ -7795,12 +7802,11 @@ fn simulate(
 
             // Loop on batches and find those which need sorting
             for effect_batch in batcher.iter() {
-                if !effect_batch.layout_flags.contains(LayoutFlags::RIBBONS) {
+                if !effect_batch.layout_flags.needs_sort() {
                     continue;
                 }
-                trace!("Processing RIBBONS effect batch for sorting...");
-                assert!(effect_batch.particle_layout.contains(Attribute::RIBBON_ID));
-                assert!(effect_batch.particle_layout.contains(Attribute::AGE)); // or is that optional?
+                trace!("Processing effect batch for sorting...");
+                assert!(sort::sort_key_offsets(&effect_batch.particle_layout).is_some());
 
                 let Some(effect_buffer) = effect_cache.get_slab(&effect_batch.slab_id) else {
                     warn!("Missing sort-fill effect buffer.");
