@@ -3,6 +3,14 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- New particles are seeded by their index in the frame's spawn, not by the slot they take.
+  Threads race for slots, and which are free depends on the order earlier particles died, so
+  the same effect gave different random draws, and different frames, on every run.
+
 ## [0.20.0] 2026-11-01
 
 _This version is compatible with Bevy 0.20_
