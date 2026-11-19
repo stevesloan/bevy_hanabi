@@ -6886,8 +6886,7 @@ pub(crate) fn prepare_bind_groups(
 
             // Bind group @0 of sort-copy pass
             let indirect_index_buffer = effect_buffer.indirect_index_buffer();
-            let Some(draw_indirect_buffer) = effects_meta.draw_indirect_args_buffer.buffer()
-            else {
+            let Some(draw_indirect_buffer) = effects_meta.draw_indirect_args_buffer.buffer() else {
                 continue;
             };
             if let Err(err) = sort_bind_groups.ensure_sort_copy_bind_group(
@@ -7026,7 +7025,9 @@ fn draw<'w>(
     assert!(spawner_size >= GpuSpawnerParams::min_size().get() as u32);
 
     // A band's batch info and draw args follow its effect's, nearest first.
-    let band_row = effect_draw_batch.depth_slice.map_or(0, |slice| slice.band + 1);
+    let band_row = effect_draw_batch
+        .depth_slice
+        .map_or(0, |slice| slice.band + 1);
     let band_offset = band_row * batcher.batch_info_buffer_aligned_size();
 
     match render_mesh.buffer_info {

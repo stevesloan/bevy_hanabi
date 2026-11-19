@@ -773,8 +773,18 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         })
     };
-    let fill_pipeline = pipeline("hanabi:test:slices:fill", &fill_bgl, &fill_shader, "sort_fill");
-    let copy_pipeline = pipeline("hanabi:test:slices:copy", &copy_bgl, &copy_shader, "sort_copy");
+    let fill_pipeline = pipeline(
+        "hanabi:test:slices:fill",
+        &fill_bgl,
+        &fill_shader,
+        "sort_fill",
+    );
+    let copy_pipeline = pipeline(
+        "hanabi:test:slices:copy",
+        &copy_bgl,
+        &copy_shader,
+        "sort_copy",
+    );
     let (sort_pipeline, sort_bg) = create_sort_pipeline(wgpu_device, &sort_buffer);
 
     let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -807,8 +817,14 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
         label: Some("hanabi:test:slices:merge"),
         source: wgpu::ShaderSource::Wgsl(merge_source.into()),
     });
-    let merge_pipeline = pipeline("hanabi:test:slices:merge", &merge_bgl, &merge_shader, "merge_sort");
-    let merge_stride = (GpuMergeParams::min_size().get() as u32).next_multiple_of(storage_alignment);
+    let merge_pipeline = pipeline(
+        "hanabi:test:slices:merge",
+        &merge_bgl,
+        &merge_shader,
+        "merge_sort",
+    );
+    let merge_stride =
+        (GpuMergeParams::min_size().get() as u32).next_multiple_of(storage_alignment);
 
     let per_thread = count.div_ceil(64);
     let mut passes = vec![
@@ -816,7 +832,12 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
         (&sort_pipeline, &sort_bg, vec![], count.div_ceil(1024)),
     ];
     for pass in 0..merge_params.len() as u32 {
-        passes.push((&merge_pipeline, &merge_bg, vec![pass * merge_stride], per_thread));
+        passes.push((
+            &merge_pipeline,
+            &merge_bg,
+            vec![pass * merge_stride],
+            per_thread,
+        ));
     }
     passes.push((&copy_pipeline, &copy_bg, vec![0, 0], per_thread));
     // A pass each, as the real chain: storage writes are visible to the next.
@@ -831,12 +852,8 @@ fn sort_depth_slices(distances: &[f32], edges: &[f32]) -> ([u32; 8], Vec<u32>, V
     }
     submit_and_wait(&device, &queue, encoder.finish());
 
-    let spawner_out = readback_vec::<u8>(
-        &device,
-        &queue,
-        &spawner_buffer,
-        storage_alignment as u64,
-    );
+    let spawner_out =
+        readback_vec::<u8>(&device, &queue, &spawner_buffer, storage_alignment as u64);
     let spawner_out: GpuSpawnerParams =
         bytemuck::pod_read_unaligned(&spawner_out[..size_of::<GpuSpawnerParams>()]);
     let indirect_out = readback_vec::<u32>(
@@ -880,11 +897,20 @@ fn real_sort_orders_many_particles_far_to_near() {
     );
     let mut seen = sorted.clone();
     seen.sort_unstable();
-    assert!(seen.iter().copied().eq(0..distances.len() as u32), "each particle once");
+    assert!(
+        seen.iter().copied().eq(0..distances.len() as u32),
+        "each particle once"
+    );
     let at_least = |edge: f32| distances.iter().filter(|&&d| d >= edge).count() as u32;
     assert_eq!(
         &rows[..5],
-        &[at_least(4.0), at_least(10.0), at_least(25.0), at_least(60.0), 150_000]
+        &[
+            at_least(4.0),
+            at_least(10.0),
+            at_least(25.0),
+            at_least(60.0),
+            150_000
+        ]
     );
     let total: u32 = bands[..5].iter().sum();
     assert_eq!(total, 150_000);
