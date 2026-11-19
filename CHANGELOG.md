@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   custom modifier code in the init, update and render shaders as `material_buffer_N`. The
   `ShaderBuffer` for each slot is given by `EffectMaterial::buffers`; rewriting it each frame
   hands an effect per-frame data of any length, such as a list of emitters for its init.
+- Added `ShaderWriter::add_import()` and `RenderContext::add_import()`: a modifier can import
+  a shader item registered as a shader library, such as another crate's functions, by its full
+  path. Each is imported once, at the top of its stage's shader.
 
 ### Fixed
 

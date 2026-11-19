@@ -43,7 +43,7 @@
 
 use std::{
     borrow::Cow,
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, BTreeSet},
     hash::{Hash, Hasher},
 };
 
@@ -209,6 +209,9 @@ pub struct ShaderWriter<'a> {
     /// This contains optional WGSL code emitted at shader top level. This
     /// generally contains functions called from `main_code`.
     pub extra_code: String,
+    /// Shader items imported at the top of the shader, by full path
+    /// (`some_crate::module::item`); see [`ShaderWriter::add_import()`].
+    pub imports: BTreeSet<String>,
     /// Layout of properties for the current effect.
     pub property_layout: &'a PropertyLayout,
     /// Layout of attributes of a particle for the current effect.
@@ -238,6 +241,7 @@ impl<'a> ShaderWriter<'a> {
         Self {
             main_code: String::new(),
             extra_code: String::new(),
+            imports: BTreeSet::new(),
             property_layout,
             particle_layout,
             texture_layout,
@@ -253,6 +257,14 @@ impl<'a> ShaderWriter<'a> {
     pub fn with_attribute_pointer(mut self) -> Self {
         self.is_attribute_pointer = true;
         self
+    }
+
+    /// Import a shader item by its full path (`some_crate::module::item`) at
+    /// the top of the shader, for the emitted code to use: one registered
+    /// as a shader library, such as another crate's functions. Each item is
+    /// imported once however many modifiers ask for it.
+    pub fn add_import(&mut self, item: impl Into<String>) {
+        self.imports.insert(item.into());
     }
 
     /// Mark the shader as emitting GPU spawn events.
@@ -392,6 +404,9 @@ pub struct RenderContext<'a> {
     /// Extra functions emitted at top level, which `vertex_code` and
     /// `fragment_code` can call.
     pub render_extra: String,
+    /// Shader items imported at the top of the render shader, by full path
+    /// (`some_crate::module::item`); see [`RenderContext::add_import()`].
+    pub imports: BTreeSet<String>,
     /// Texture layout.
     pub texture_layout: &'a TextureLayout,
     /// Effect textures.
@@ -429,6 +444,7 @@ impl<'a> RenderContext<'a> {
             vertex_code: String::new(),
             fragment_code: String::new(),
             render_extra: String::new(),
+            imports: BTreeSet::new(),
             texture_layout,
             textures: vec![],
             sprite_grid_size: None,
@@ -457,6 +473,13 @@ impl<'a> RenderContext<'a> {
     /// shader.
     pub fn set_needs_particle_fragment(&mut self) {
         self.needs_particle_fragment = true;
+    }
+
+    /// Import a shader item by its full path (`some_crate::module::item`) at
+    /// the top of the render shader, for the vertex or fragment code to use;
+    /// see [`ShaderWriter::add_import()`].
+    pub fn add_import(&mut self, item: impl Into<String>) {
+        self.imports.insert(item.into());
     }
 
     /// Add a color gradient.

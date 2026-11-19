@@ -5,6 +5,7 @@ import bevy_hanabi::render::vfx_common::{
     rand_uniform_f, rand_uniform_vec2, rand_uniform_vec3, rand_uniform_vec4,
     rand_normal_f, rand_normal_vec2, rand_normal_vec3, rand_normal_vec4, proj
 };
+{{IMPORTS}}
 
 struct Particle {
 {{ATTRIBUTES}}
