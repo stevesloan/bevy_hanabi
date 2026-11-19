@@ -1313,7 +1313,9 @@ impl EffectShaderSources {
             let problem = if asset.sort_mode != SortMode::BackToFront {
                 Some("they require sort_mode SortMode::BackToFront".to_string())
             } else if edges.len() > MAX_DEPTH_SLICE_EDGES {
-                Some(format!("at most {MAX_DEPTH_SLICE_EDGES} edges are supported"))
+                Some(format!(
+                    "at most {MAX_DEPTH_SLICE_EDGES} edges are supported"
+                ))
             } else if !edges.iter().all(|edge| edge.is_finite() && *edge > 0.0)
                 || edges.windows(2).any(|pair| pair[0] >= pair[1])
             {
@@ -3029,10 +3031,16 @@ else { return c1; }
             (SortMode::BackToFront, &[4.0, 4.0][..]),
             (SortMode::BackToFront, &[0.0, 4.0][..]),
             (SortMode::BackToFront, &[4.0, f32::INFINITY][..]),
-            (SortMode::BackToFront, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..]),
+            (
+                SortMode::BackToFront,
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..],
+            ),
         ] {
             assert!(
-                matches!(sliced(sort_mode, edges), Err(ShaderGenerateError::Validate(_))),
+                matches!(
+                    sliced(sort_mode, edges),
+                    Err(ShaderGenerateError::Validate(_))
+                ),
                 "{sort_mode:?} {edges:?}"
             );
         }
