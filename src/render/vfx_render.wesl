@@ -6,6 +6,7 @@ import bevy_hanabi::render::vfx_common::{
     rand_normal_f, rand_normal_vec2, rand_normal_vec3, rand_normal_vec4, proj,
     unpack_compressed_transform, unpack_compressed_transform_3x3_transpose
 };
+{{IMPORTS}}
 
 struct Particle {
 {{ATTRIBUTES}}

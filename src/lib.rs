@@ -1398,7 +1398,13 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
         }
 
         // Generate the shader code for the initializing shader
-        let (init_code, init_extra, init_sim_space_transform_code, consume_gpu_spawn_events) = {
+        let (
+            init_code,
+            init_extra,
+            init_imports,
+            init_sim_space_transform_code,
+            consume_gpu_spawn_events,
+        ) = {
             // Apply all the init modifiers
             let mut init_context = ShaderWriter::new(
                 ModifierContext::Init,
@@ -1430,6 +1436,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             (
                 init_context.main_code,
                 init_context.extra_code,
+                import_lines(&init_context.imports),
                 sim_space_transform_code,
                 consume_gpu_spawn_events,
             )
@@ -1462,6 +1469,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             .replace("{{PARENT_PARTICLE}}", &parent_particle_code)
             .replace("{{INIT_CODE}}", &init_code)
             .replace("{{INIT_EXTRA}}", &init_extra)
+            .replace("{{IMPORTS}}", &init_imports)
             .replace("{{PROPERTIES}}", &properties_code)
             .replace("{{PROPERTIES_BINDING}}", &properties_binding_code)
             .replace("{{MATERIAL_BINDINGS}}", &material_bindings_code)
@@ -1476,7 +1484,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
         );
 
         // Generate the shader code for the update shader
-        let (mut update_code, update_extra, emit_gpu_spawn_events) = {
+        let (mut update_code, update_extra, update_imports, emit_gpu_spawn_events) = {
             let mut update_context = ShaderWriter::new(
                 ModifierContext::Update,
                 &property_layout,
@@ -1498,6 +1506,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             (
                 update_context.main_code,
                 update_context.extra_code,
+                import_lines(&update_context.imports),
                 emit_gpu_spawn_events,
             )
         };
@@ -1544,6 +1553,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             vertex_code,
             fragment_code,
             render_extra,
+            render_imports,
             alpha_cutoff_code,
             flipbook_scale_code,
             flipbook_row_count_code,
@@ -1605,6 +1615,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
                 render_context.vertex_code,
                 render_context.fragment_code,
                 render_context.render_extra,
+                import_lines(&render_context.imports),
                 alpha_cutoff_code,
                 flipbook_scale_code,
                 flipbook_row_count_code,
@@ -1681,6 +1692,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             .replace("{{UPDATE_CODE}}", &update_code)
             .replace("{{WRITEBACK_CODE}}", &writeback_code)
             .replace("{{UPDATE_EXTRA}}", &update_extra)
+            .replace("{{IMPORTS}}", &update_imports)
             .replace("{{PROPERTIES}}", &properties_code)
             .replace("{{PROPERTIES_BINDING}}", &properties_binding_code)
             .replace("{{MATERIAL_BINDINGS}}", &material_bindings_code)
@@ -1709,6 +1721,7 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
             .replace("{{VERTEX_MODIFIERS}}", &vertex_code)
             .replace("{{FRAGMENT_MODIFIERS}}", &fragment_code)
             .replace("{{RENDER_EXTRA}}", &render_extra)
+            .replace("{{IMPORTS}}", &render_imports)
             .replace("{{ALPHA_CUTOFF}}", &alpha_cutoff_code)
             .replace("{{FLIPBOOK_SCALE}}", &flipbook_scale_code)
             .replace("{{FLIPBOOK_ROW_COUNT}}", &flipbook_row_count_code);
@@ -2270,6 +2283,14 @@ fn update_properties_from_asset(
     }
 }
 
+/// One `import` line per shader item, for a template's `{{IMPORTS}}`.
+fn import_lines(items: &std::collections::BTreeSet<String>) -> String {
+    items
+        .iter()
+        .map(|item| format!("import {item};\n"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::DerefMut;
@@ -2585,6 +2606,57 @@ else { return c1; }
         fn new(visibility: Option<Visibility>) -> Self {
             Self { visibility }
         }
+    }
+
+    /// Adds an import to the init shader, as a modifier using another
+    /// crate's shader functions would.
+    #[derive(Debug, Clone, Reflect)]
+    struct ImportsInit(&'static str);
+
+    impl Modifier for ImportsInit {
+        fn context(&self) -> ModifierContext {
+            ModifierContext::Init
+        }
+
+        fn attributes(&self) -> std::borrow::Cow<'_, [Attribute]> {
+            std::borrow::Cow::Borrowed(&[Attribute::POSITION])
+        }
+
+        fn boxed_clone(&self) -> BoxedModifier {
+            Box::new(self.clone())
+        }
+
+        fn apply(&self, _module: &mut Module, context: &mut ShaderWriter) -> Result<(), ExprError> {
+            context.add_import(self.0);
+            Ok(())
+        }
+    }
+
+    /// A modifier's imports reach the top of its stage's shader, once each,
+    /// and no other stage's.
+    #[test]
+    fn modifier_imports_reach_their_shader() {
+        let mut module = Module::default();
+        let zero = module.lit(Vec3::ZERO);
+        let asset = EffectAsset::new(256, SpawnerSettings::rate(32.0.into()), module)
+            .init(SetAttributeModifier::new(Attribute::POSITION, zero))
+            .init(ImportsInit("some_crate::fog::apply"))
+            .init(ImportsInit("some_crate::fog::apply"));
+        let sources = EffectShaderSources::generate(&asset, None, 0).unwrap();
+        let init = &sources.init_shader_source;
+        assert_eq!(
+            init.matches("import some_crate::fog::apply;").count(),
+            1,
+            "{init}"
+        );
+        assert!(
+            init.find("import some_crate::fog::apply;") < init.find("struct Particle"),
+            "imports precede declarations"
+        );
+        assert!(!init.contains("{{IMPORTS}}"));
+        assert!(!sources.update_shader_source.contains("some_crate"));
+        assert!(!sources.update_shader_source.contains("{{IMPORTS}}"));
+        assert!(!sources.render_shader_source.contains("{{IMPORTS}}"));
     }
 
     #[test]
