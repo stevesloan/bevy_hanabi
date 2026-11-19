@@ -8050,6 +8050,7 @@ fn simulate(
                         else {
                             warn!("Missing draw indirect buffer for sort-copy.");
                             compute_pass.insert_debug_marker("ERROR:MissingSortCopyDrawBuffer");
+                            compute_pass.pop_debug_group();
                             continue;
                         };
                         let Some(bind_group) = sort_bind_groups.sort_copy_bind_group(
