@@ -4200,14 +4200,15 @@ pub fn prepare_indirect_pipeline(
 
     for (index, has_events) in [false, true].into_iter().enumerate() {
         if effects_meta.copy_count_pipeline_ids[index] == CachedComputePipelineId::INVALID {
-            effects_meta.copy_count_pipeline_ids[index] = specialized_indirect_pipelines.specialize(
-                pipeline_cache.as_ref(),
-                &indirect_pipeline,
-                DispatchIndirectPipelineKey {
-                    has_events,
-                    copy_instance_count: true,
-                },
-            );
+            effects_meta.copy_count_pipeline_ids[index] = specialized_indirect_pipelines
+                .specialize(
+                    pipeline_cache.as_ref(),
+                    &indirect_pipeline,
+                    DispatchIndirectPipelineKey {
+                        has_events,
+                        copy_instance_count: true,
+                    },
+                );
         }
     }
 
@@ -7902,7 +7903,11 @@ fn simulate(
         } else {
             true
         };
-        if events_bound && compute_pass.set_cached_compute_pipeline(pipeline_id).is_ok() {
+        if events_bound
+            && compute_pass
+                .set_cached_compute_pipeline(pipeline_id)
+                .is_ok()
+        {
             const WORKGROUP_SIZE: u32 = 64;
             let total_effect_count = effects_meta.spawner_buffer.len() as u32;
             compute_pass.set_bind_group(0, init_and_indirect_sim_params_bind_group, &[]);
@@ -7952,7 +7957,9 @@ fn simulate(
                     .is_err()
                 {
                     // FIXME - Bevy doesn't allow returning custom errors here...
-                    trace!("ERROR - Failed to set prefix sum compute pipeline. Simulation aborted.");
+                    trace!(
+                        "ERROR - Failed to set prefix sum compute pipeline. Simulation aborted."
+                    );
                     return;
                 }
 
@@ -8069,7 +8076,8 @@ fn simulate(
                                 .set_cached_compute_pipeline(pipeline_id)
                                 .is_err()
                             {
-                                compute_pass.insert_debug_marker("ERROR:FailedToSetSortFillPipeline");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:FailedToSetSortFillPipeline");
                                 compute_pass.pop_debug_group();
                                 return;
                             }
@@ -8085,7 +8093,8 @@ fn simulate(
                             let indirect_index_buffer = effect_buffer.indirect_index_buffer();
                             let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
                                 warn!("Missing spawner buffer for sort-fill.");
-                                compute_pass.insert_debug_marker("ERROR:MissingSortFillSpawnerBuffer");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:MissingSortFillSpawnerBuffer");
                                 continue;
                             };
                             let Some(bind_group) = sort_bind_groups.sort_fill_bind_group(
@@ -8213,7 +8222,8 @@ fn simulate(
                                 .set_cached_compute_pipeline(pipeline_id)
                                 .is_err()
                             {
-                                compute_pass.insert_debug_marker("ERROR:FailedToSetSortCopyPipeline");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:FailedToSetSortCopyPipeline");
                                 compute_pass.pop_debug_group();
                                 return;
                             }
@@ -8228,7 +8238,8 @@ fn simulate(
                             let indirect_index_buffer = effect_buffer.indirect_index_buffer();
                             let Some(spawner_buffer) = effects_meta.spawner_buffer.buffer() else {
                                 warn!("Missing spawner buffer for sort-copy.");
-                                compute_pass.insert_debug_marker("ERROR:MissingSortCopySpawnerBuffer");
+                                compute_pass
+                                    .insert_debug_marker("ERROR:MissingSortCopySpawnerBuffer");
                                 continue;
                             };
                             let Some(draw_indirect_buffer) =
