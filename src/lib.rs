@@ -1764,6 +1764,9 @@ pub struct CompiledParticleEffect {
     /// Particle layout the effect's shaders were generated for. Kept so
     /// extraction doesn't rebuild it from the asset every frame.
     particle_layout: ParticleLayout,
+    /// Property layout the effect's shaders were generated for. Kept for the
+    /// same reason as `particle_layout`.
+    property_layout: PropertyLayout,
     /// Particle layout of the parent effect, if any.
     parent_particle_layout: Option<ParticleLayout>,
     /// PRNG seed.
@@ -1785,6 +1788,7 @@ impl Default for CompiledParticleEffect {
             layout_flags: LayoutFlags::NONE,
             alpha_mode: default(),
             particle_layout: default(),
+            property_layout: default(),
             parent_particle_layout: None,
             prng_seed: 0,
             is_ready: false,
@@ -1887,6 +1891,7 @@ impl CompiledParticleEffect {
         self.layout_flags = shader_source.layout_flags;
         self.alpha_mode = asset.alpha_mode;
         self.particle_layout = asset.particle_layout();
+        self.property_layout = asset.property_layout();
         self.parent_particle_layout = parent_layout;
         trace!(
             "Compiled effect sources: layout_flags={:?} alpha_mode={:?}",
