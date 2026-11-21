@@ -2743,7 +2743,7 @@ pub(crate) fn extract_effects(
         );
         let new_extracted_effect = ExtractedEffect {
             handle: compiled_effect.asset.clone(),
-            particle_layout: asset.particle_layout().clone(),
+            particle_layout: compiled_effect.particle_layout.clone(),
             capacity: asset.capacity(),
             layout_flags,
             texture_layout,
