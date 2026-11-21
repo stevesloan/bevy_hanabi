@@ -2752,7 +2752,7 @@ pub(crate) fn extract_effects(
             .unwrap_or((None, None, None, None, None));
 
         // Validate material
-        let texture_layout = asset.module().texture_layout();
+        let texture_layout = asset.module().texture_layout_ref();
         let num_expected_tex = texture_layout.layout.len();
         if compiled_effect.textures.len() < num_expected_tex {
             error!(
@@ -2764,7 +2764,7 @@ pub(crate) fn extract_effects(
             );
             continue;
         }
-        let textures = if compiled_effect.textures.len() > num_expected_tex {
+        if compiled_effect.textures.len() > num_expected_tex {
             trace!(
                 "Instance of effect '{}' on entity {:?} has too many textures. Layout expected {} textures, but CompiledParticleEffect got {} instead. Ignoring the extra ones.",
                 asset.name,
@@ -2772,10 +2772,8 @@ pub(crate) fn extract_effects(
                 num_expected_tex,
                 compiled_effect.textures.len()
             );
-            compiled_effect.textures[..num_expected_tex].to_vec()
-        } else {
-            compiled_effect.textures.clone()
-        };
+        }
+        let textures = &compiled_effect.textures[..num_expected_tex];
         let num_expected_buffers = texture_layout.buffers.len();
         if compiled_effect.buffers.len() < num_expected_buffers {
             error!(
@@ -2787,7 +2785,7 @@ pub(crate) fn extract_effects(
             );
             continue;
         }
-        let buffers = compiled_effect.buffers[..num_expected_buffers].to_vec();
+        let buffers = &compiled_effect.buffers[..num_expected_buffers];
 
         // Extract general effect data
         let layout_flags = compiled_effect.layout_flags;
@@ -2801,27 +2799,59 @@ pub(crate) fn extract_effects(
             textures.len(),
             layout_flags,
         );
-        let new_extracted_effect = ExtractedEffect {
-            handle: compiled_effect.asset.clone(),
-            particle_layout: compiled_effect.particle_layout.clone(),
-            capacity: asset.capacity(),
-            layout_flags,
-            texture_layout,
-            textures,
-            buffers,
-            alpha_mode,
-            effect_shaders: effect_shaders.clone(),
-            simulation_condition: asset.simulation_condition,
-            depth_slices: asset.depth_slices.clone(),
-        };
-        if let Some(mut extracted_effect) = maybe_extracted_effect {
-            extracted_effect.set_if_neq(new_extracted_effect);
-        } else {
-            trace!(
-                "Inserting new ExtractedEffect component on {:?}",
-                render_entity
-            );
-            cmd.insert(new_extracted_effect);
+        // Compare in place before building a new ExtractedEffect, which would
+        // clone its layouts, textures and shaders: too costly to do for every
+        // effect every frame when almost none change. Destructured so that a
+        // new field can't be left out of the comparison.
+        let unchanged = maybe_extracted_effect.as_ref().is_some_and(|extracted| {
+            let ExtractedEffect {
+                handle,
+                particle_layout,
+                capacity,
+                layout_flags: extracted_layout_flags,
+                texture_layout: extracted_texture_layout,
+                textures: extracted_textures,
+                buffers: extracted_buffers,
+                alpha_mode: extracted_alpha_mode,
+                effect_shaders: extracted_effect_shaders,
+                simulation_condition,
+                depth_slices,
+            } = &**extracted;
+            *handle == compiled_effect.asset
+                && *particle_layout == compiled_effect.particle_layout
+                && *capacity == asset.capacity()
+                && *extracted_layout_flags == layout_flags
+                && extracted_texture_layout == texture_layout
+                && extracted_textures.as_slice() == textures
+                && extracted_buffers.as_slice() == buffers
+                && *extracted_alpha_mode == alpha_mode
+                && extracted_effect_shaders == effect_shaders
+                && *simulation_condition == asset.simulation_condition
+                && *depth_slices == asset.depth_slices
+        });
+        if !unchanged {
+            let new_extracted_effect = ExtractedEffect {
+                handle: compiled_effect.asset.clone(),
+                particle_layout: compiled_effect.particle_layout.clone(),
+                capacity: asset.capacity(),
+                layout_flags,
+                texture_layout: texture_layout.clone(),
+                textures: textures.to_vec(),
+                buffers: buffers.to_vec(),
+                alpha_mode,
+                effect_shaders: effect_shaders.clone(),
+                simulation_condition: asset.simulation_condition,
+                depth_slices: asset.depth_slices.clone(),
+            };
+            if let Some(mut extracted_effect) = maybe_extracted_effect {
+                *extracted_effect = new_extracted_effect;
+            } else {
+                trace!(
+                    "Inserting new ExtractedEffect component on {:?}",
+                    render_entity
+                );
+                cmd.insert(new_extracted_effect);
+            }
         }
 
         // Extract the spawner data
@@ -2904,8 +2934,9 @@ pub(crate) fn extract_effects(
             cmd.remove::<ChildEffectOf>();
         }
 
-        // Extract property data
-        let property_layout = asset.property_layout();
+        // Extract property data, from the layout the effect was compiled with,
+        // cloned only when the extracted one differs.
+        let property_layout = &compiled_effect.property_layout;
         if property_layout.is_empty() {
             cmd.remove::<ExtractedProperties>();
         } else {
@@ -2917,7 +2948,7 @@ pub(crate) fn extract_effects(
             let property_data = if let Some(properties) = maybe_properties {
                 if properties.is_changed() {
                     trace!("Detected property change, re-serializing...");
-                    Some(properties.serialize(&property_layout))
+                    Some(properties.serialize(property_layout))
                 } else {
                     None
                 }
@@ -2925,27 +2956,28 @@ pub(crate) fn extract_effects(
                 None
             };
 
-            let new_properties = ExtractedProperties {
-                property_layout,
-                property_data,
-            };
-            trace!("new_properties = {new_properties:?}");
-
             if let Some(mut extracted_properties) = maybe_extracted_properties {
                 // Always mutate if there's new CPU data to re-upload. Otherwise
                 // check for any other change.
-                if new_properties.property_data.is_some()
-                    || (extracted_properties.property_layout != new_properties.property_layout)
+                if property_data.is_some()
+                    || extracted_properties.property_layout != *property_layout
                 {
                     trace!(
                         "Updating existing ExtractedProperties (was: {:?})",
                         extracted_properties.as_ref()
                     );
-                    *extracted_properties = new_properties;
+                    *extracted_properties = ExtractedProperties {
+                        property_layout: property_layout.clone(),
+                        property_data,
+                    };
                 }
             } else {
+                let new_properties = ExtractedProperties {
+                    property_layout: property_layout.clone(),
+                    property_data,
+                };
                 trace!(
-                    "Inserting new ExtractedProperties component on {:?}",
+                    "Inserting new ExtractedProperties component on {:?}: {new_properties:?}",
                     render_entity
                 );
                 cmd.insert(new_properties);

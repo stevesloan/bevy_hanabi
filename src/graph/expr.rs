@@ -827,6 +827,11 @@ impl Module {
     pub fn texture_layout(&self) -> TextureLayout {
         self.texture_layout.clone()
     }
+
+    /// Borrow the texture layout of this module, without a copy.
+    pub(crate) fn texture_layout_ref(&self) -> &TextureLayout {
+        &self.texture_layout
+    }
 }
 
 /// Errors raised when manipulating expressions [`Expr`] and node graphs
