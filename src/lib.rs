@@ -1906,6 +1906,9 @@ pub struct CompiledParticleEffect {
     layout_flags: LayoutFlags,
     /// Alpha mode.
     alpha_mode: AlphaMode,
+    /// Particle layout the effect's shaders were generated for. Kept so
+    /// extraction doesn't rebuild it from the asset every frame.
+    particle_layout: ParticleLayout,
     /// Particle layout of the parent effect, if any.
     parent_particle_layout: Option<ParticleLayout>,
     /// PRNG seed.
@@ -1927,6 +1930,7 @@ impl Default for CompiledParticleEffect {
             buffers: vec![],
             layout_flags: LayoutFlags::NONE,
             alpha_mode: default(),
+            particle_layout: default(),
             parent_particle_layout: None,
             prng_seed: 0,
             is_ready: false,
@@ -2029,6 +2033,7 @@ impl CompiledParticleEffect {
 
         self.layout_flags = shader_source.layout_flags;
         self.alpha_mode = asset.alpha_mode;
+        self.particle_layout = asset.particle_layout();
         self.parent_particle_layout = parent_layout;
         trace!(
             "Compiled effect sources: layout_flags={:?} alpha_mode={:?}",
@@ -2261,28 +2266,31 @@ fn compile_effects(
 ) {
     trace!("compile_effects: {} effect(s)", q_effects.iter().len());
 
-    // Loop over all existing effects and collect the valid ones. We do a
-    // separate pass because we can't borrow mutably while doing a double
-    // lookup on the query. This map is used to lookup valid parents, and
-    // filter out effects with a declared parent but unresolved parent
-    // asset.
-    let particle_layouts_and_parents: HashMap<Entity, (ParticleLayout, Option<Entity>)> = q_effects
-        .iter()
-        .filter_map(|(entity, effect, _, _, parent, _)| {
-            effects
-                .get(&effect.handle)
-                .map(|asset| (entity, (asset.particle_layout(), parent.map(|p| p.entity))))
-        })
-        .collect();
-
-    // Count children
-    let mut children: HashMap<Entity, Vec<Entity>> =
-        HashMap::with_capacity_and_hasher(particle_layouts_and_parents.len(), Default::default());
-    for (child, (_, parent)) in particle_layouts_and_parents.iter() {
-        if let Some(parent) = parent.as_ref() {
-            children.entry(*parent).or_default().push(*child);
+    // Collect the valid effects in a separate pass, as we can't borrow mutably
+    // while doing a double lookup on the query. Count the children of each
+    // parent, among the effects whose asset is loaded.
+    let mut children: HashMap<Entity, Vec<Entity>> = HashMap::default();
+    for (entity, effect, _, _, parent, _) in q_effects.iter() {
+        if let Some(parent) = parent {
+            if effects.contains(&effect.handle) {
+                children.entry(parent.entity).or_default().push(entity);
+            }
         }
     }
+
+    // The particle layouts of the parents whose asset is loaded, to look up
+    // valid parents and filter out effects with a declared parent but an
+    // unresolved parent asset. Only parents need one: building a layout walks
+    // all the asset's modifiers, too costly to do for every effect every frame.
+    let parent_layouts: HashMap<Entity, ParticleLayout> = children
+        .keys()
+        .filter_map(|&parent| {
+            let (_, effect, ..) = q_effects.get(parent).ok()?;
+            effects
+                .get(&effect.handle)
+                .map(|asset| (parent, asset.particle_layout()))
+        })
+        .collect();
 
     // Loop over all existing effects to update them, including invisible ones
     for (
@@ -2304,8 +2312,7 @@ fn compile_effects(
 
             // Same for the parent asset, if any.
             let (parent_entity, parent_layout) = if let Some(parent) = &parent {
-                let Some((parent_layout, _)) = particle_layouts_and_parents.get(&parent.entity)
-                else {
+                let Some(parent_layout) = parent_layouts.get(&parent.entity) else {
                     // There's a parent declared, but not found. Skip the
                     // current asset.
                     return None;
@@ -2380,7 +2387,7 @@ fn compile_effects(
         // If the effect has a parent, and that parent has no asset, also clear
         // the child's compilation.
         if let Some(parent) = parent {
-            if particle_layouts_and_parents.get(&parent.entity).is_none() {
+            if !parent_layouts.contains_key(&parent.entity) {
                 compiled_effect.clear();
             }
         }
