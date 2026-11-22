@@ -2655,7 +2655,10 @@ pub(crate) fn report_ready_state(
     let mut q_effects = main_world.query::<(RenderEntity, &mut CompiledParticleEffect)>();
     for (render_entity, mut compiled_particle_effect) in q_effects.iter_mut(&mut main_world) {
         if let Ok(cached_ready_state) = q_ready_state.get(render_entity) {
-            compiled_particle_effect.is_ready = cached_ready_state.is_ready();
+            let is_ready = cached_ready_state.is_ready();
+            if compiled_particle_effect.is_ready != is_ready {
+                compiled_particle_effect.is_ready = is_ready;
+            }
         }
     }
 }
@@ -2729,6 +2732,18 @@ pub(crate) fn extract_effects(
             .map(|cv| cv.get())
             .unwrap_or(true)
             && maybe_view_visibility.map(|cv| cv.get()).unwrap_or(true);
+
+        // A hidden effect that only simulates when visible does nothing this
+        // frame. Once the render world has it as hidden, leave it as extracted
+        // until it shows again.
+        if !is_visible
+            && asset.simulation_condition == SimulationCondition::WhenVisible
+            && q_extracted_effects
+                .get(render_entity)
+                .is_ok_and(|(_, spawner, ..)| spawner.is_some_and(|s| !s.is_visible))
+        {
+            continue;
+        }
 
         let mut cmd = commands.entity(render_entity);
 
