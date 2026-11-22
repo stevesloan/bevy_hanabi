@@ -2115,6 +2115,7 @@ fn compile_effects(
         Option<Ref<EffectMaterial>>,
         Option<Ref<EffectMesh>>,
         Option<Ref<EffectParent>>,
+        Option<&InheritedVisibility>,
         &mut CompiledParticleEffect,
     )>,
 ) {
@@ -2124,7 +2125,7 @@ fn compile_effects(
     // while doing a double lookup on the query. Count the children of each
     // parent, among the effects whose asset is loaded.
     let mut children: HashMap<Entity, Vec<Entity>> = HashMap::default();
-    for (entity, effect, _, _, parent, _) in q_effects.iter() {
+    for (entity, effect, _, _, parent, _, _) in q_effects.iter() {
         if let Some(parent) = parent {
             if effects.contains(&effect.handle) {
                 children.entry(parent.entity).or_default().push(entity);
@@ -2155,9 +2156,10 @@ fn compile_effects(
         mesh,
         parent_entity,
         parent_layout,
+        inherited_visibility,
         mut compiled_effect,
     ) in q_effects.iter_mut().filter_map(
-        |(entity, effect, material, mesh, parent, compiled_effect)| {
+        |(entity, effect, material, mesh, parent, inherited_visibility, compiled_effect)| {
             // Check if asset is available, otherwise silently ignore as we
             // can't check for changes, and conceptually it makes no
             // sense to render a particle effect whose
@@ -2187,6 +2189,7 @@ fn compile_effects(
                 mesh,
                 parent_entity,
                 parent_layout,
+                inherited_visibility,
                 compiled_effect,
             ))
         },
@@ -2219,7 +2222,11 @@ fn compile_effects(
                 &mut shaders,
                 &mut shader_cache,
             );
-        } else {
+        } else if asset.simulation_condition == SimulationCondition::Always
+            || inherited_visibility.is_none_or(|visibility| visibility.get())
+        {
+            // An effect that isn't simulating draws no random numbers.
+            //
             // Update the PRNG seed. Unfortunately at the minute the "seed"
             // (which really is the internal PRNG state rather) is
             // not cached on GPU, and is re-uploaded each frame, so
@@ -2232,7 +2239,7 @@ fn compile_effects(
     }
 
     // Clear removed effects, to allow them to be released by the asset server
-    for (_, effect, _, _, parent, mut compiled_effect) in q_effects.iter_mut() {
+    for (_, effect, _, _, parent, _, mut compiled_effect) in q_effects.iter_mut() {
         // If the effect has no asset, clear its compilation
         if effects.get(&effect.handle).is_none() {
             compiled_effect.clear();
